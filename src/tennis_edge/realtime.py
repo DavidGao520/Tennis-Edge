@@ -356,15 +356,12 @@ class RealtimeMonitor:
         r1 = self._tracker.get_rating(p1_id, date.today())
         r2 = self._tracker.get_rating(p2_id, date.today())
 
-        # Serve probabilities and in-play model at 0-0
+        # Serve probabilities: sp1 = player's serve%, sp2 = opponent's serve%
+        # InPlayModel(sp1, sp2) → P(player wins), which is what we want for this YES market
         sp1, sp2 = serve_prob_from_glicko(r1.mu, r2.mu)
         model = InPlayModel(sp1, sp2)
         pre_match = model.win_probability(MatchScore(best_of=3))
 
-        # Determine if player is p1 (higher rated)
-        if r1.mu >= r2.mu:
-            state.model_prob = pre_match
-        else:
-            state.model_prob = 1 - pre_match
-
-        state.pre_match_prob = state.model_prob
+        # pre_match is already P(player wins) — no flip needed
+        state.model_prob = pre_match
+        state.pre_match_prob = pre_match
