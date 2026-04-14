@@ -25,7 +25,6 @@ from .config import AppConfig
 from .data.db import Database
 from .exchange.auth import KalshiAuth
 from .exchange.client import KalshiClient
-from .exchange.livescore import LiveScore, fetch_live_scores
 from .exchange.ws import (
     KalshiWebSocket,
     TickerUpdate,
@@ -33,6 +32,7 @@ from .exchange.ws import (
     TradeUpdate,
 )
 from .model.inplay import InPlayModel, MatchScore, serve_prob_from_glicko
+
 from .ratings.glicko2 import Glicko2Engine
 from .ratings.tracker import RatingTracker
 from .strategy.kelly import edge, expected_value, fractional_kelly
@@ -40,7 +40,6 @@ from .strategy.kelly import edge, expected_value, fractional_kelly
 logger = logging.getLogger(__name__)
 console = Console()
 
-LIVE_SCORE_INTERVAL = 30  # seconds between ESPN score fetches
 
 
 @dataclass
@@ -58,18 +57,10 @@ class MarketState:
     volume: int = 0
     market_prob: float = 0.5
 
-    # Model probabilities
-    pre_match_prob: float | None = None   # Glicko-2 pre-match
-    live_prob: float | None = None        # In-play from live score
-    live_score_display: str = ""          # "6-4 3-2"
+    # Model
+    pre_match_prob: float | None = None   # Glicko-2 pre-match anchor
 
-    # Serve probs (cached for in-play model)
-    sp1: float = 0.64  # player serve %
-    sp2: float = 0.64  # opponent serve %
-    player_id: int | None = None
-    opponent_id: int | None = None
-
-    # EV (computed from live_prob if available, else pre_match)
+    # EV: edge = pre_match - market (how far market drifted from pre-match anchor)
     edge_val: float = 0.0
     ev_per_dollar: float = 0.0
     kelly_pct: float = 0.0
@@ -80,11 +71,6 @@ class MarketState:
     last_update: str = ""
     update_count: int = 0
 
-    @property
-    def effective_prob(self) -> float | None:
-        """Best available model probability: live > pre-match."""
-        return self.live_prob if self.live_prob is not None else self.pre_match_prob
-
 
 class RealtimeMonitor:
     """Real-time monitor: WebSocket prices + live scores → EV dashboard."""
@@ -94,8 +80,6 @@ class RealtimeMonitor:
         self.markets: dict[str, MarketState] = {}
         self.tennis_tickers: set[str] = set()
         self.total_updates = 0
-        self.live_scores: list[LiveScore] = []
-        self.last_score_fetch = ""
         self.alerts: list[str] = []
         self._db: Database | None = None
         self._tracker: RatingTracker | None = None
@@ -150,106 +134,11 @@ class RealtimeMonitor:
 
         console.print("[bold]Connecting to Kalshi WebSocket...[/]\n")
 
-        # Run WebSocket, live score fetcher, and display in parallel
+        # Run WebSocket and display in parallel
         await asyncio.gather(
             ws.connect(),
-            self._live_score_loop(),
             self._display_loop(),
         )
-
-    # ── Live Score Integration ──
-
-    async def _live_score_loop(self) -> None:
-        """Periodically fetch live scores and update in-play probabilities."""
-        while True:
-            try:
-                self.live_scores = await fetch_live_scores()
-                live_matches = [s for s in self.live_scores if s.status == "live"]
-                self.last_score_fetch = datetime.now().strftime("%H:%M:%S")
-
-                # Match live scores to Kalshi markets
-                for state in self.markets.values():
-                    self._update_live_prob(state, live_matches)
-
-            except Exception as e:
-                logger.debug("Live score fetch error: %s", e)
-
-            await asyncio.sleep(LIVE_SCORE_INTERVAL)
-
-    def _update_live_prob(self, state: MarketState, live_matches: list[LiveScore]) -> None:
-        """Match a market to a live score and compute in-play probability."""
-        if not state.player_name:
-            return
-
-        player_last = state.player_name.split()[-1].lower()
-        opponent_last = state.opponent_name.split()[-1].lower() if state.opponent_name else ""
-
-        matched_score = None
-        player_is_p1 = True
-
-        for live in live_matches:
-            p1_last = live.player1.split()[-1].lower()
-            p2_last = live.player2.split()[-1].lower()
-
-            if player_last == p1_last and (not opponent_last or opponent_last == p2_last):
-                matched_score = live
-                player_is_p1 = True
-                break
-            elif player_last == p2_last and (not opponent_last or opponent_last == p1_last):
-                matched_score = live
-                player_is_p1 = False
-                break
-
-        if not matched_score:
-            state.live_prob = None
-            state.live_score_display = ""
-            return
-
-        # Parse score into sets
-        completed_sets = []
-        current_set_games = (0, 0)
-
-        for g1, g2 in matched_score.sets:
-            set_complete = (
-                (g1 >= 6 or g2 >= 6) and abs(g1 - g2) >= 2
-            ) or g1 == 7 or g2 == 7
-            if set_complete:
-                completed_sets.append((g1, g2))
-            else:
-                current_set_games = (g1, g2)
-
-        sets_p1 = sum(1 for s in completed_sets if s[0] > s[1])
-        sets_p2 = sum(1 for s in completed_sets if s[1] > s[0])
-
-        # In-play model with p1 = live.player1
-        # serve probs: need to figure out which player maps to which
-        if player_is_p1:
-            sp1, sp2 = state.sp1, state.sp2
-            score = MatchScore(
-                sets1=sets_p1, sets2=sets_p2,
-                games1=current_set_games[0], games2=current_set_games[1],
-                serving=matched_score.serving, best_of=3,
-            )
-        else:
-            sp1, sp2 = state.sp2, state.sp1  # swap: p1 in model = live.player1
-            score = MatchScore(
-                sets1=sets_p1, sets2=sets_p2,
-                games1=current_set_games[0], games2=current_set_games[1],
-                serving=matched_score.serving, best_of=3,
-            )
-
-        model = InPlayModel(sp1, sp2)
-        p1_win_prob = model.win_probability(score)
-
-        # Convert to YES player's probability
-        if player_is_p1:
-            state.live_prob = p1_win_prob
-        else:
-            state.live_prob = 1.0 - p1_win_prob
-
-        # Score display
-        score_str = " ".join(f"{s[0]}-{s[1]}" for s in matched_score.sets)
-        state.live_score_display = score_str
 
     # ── WebSocket Handlers ──
 
@@ -283,8 +172,8 @@ class RealtimeMonitor:
         else:
             return
 
-        # EV calculation: use live_prob (in-play) if available, else pre_match
-        prob = state.effective_prob
+        # EV: edge = pre_match - market (how far market drifted from anchor)
+        prob = state.pre_match_prob
         if prob is not None and 0.01 < state.market_prob < 0.99:
             state.edge_val = edge(prob, state.market_prob)
             state.ev_per_dollar = expected_value(prob, state.market_prob)
@@ -304,10 +193,9 @@ class RealtimeMonitor:
 
             # Alert on strong signals
             if abs_edge >= 0.08 and state.update_count <= 3:
-                src = "LIVE" if state.live_prob is not None else "PRE"
                 self.alerts.append(
                     f"[bold yellow]⚡ {state.signal}[/] {state.player_name}: "
-                    f"{src}={prob*100:.0f}% mkt={state.market_prob*100:.0f}% "
+                    f"pre={prob*100:.0f}% mkt={state.market_prob*100:.0f}% "
                     f"edge={state.edge_val*100:+.1f}% → {state.side}"
                 )
                 if len(self.alerts) > 20:
@@ -340,28 +228,25 @@ class RealtimeMonitor:
         ]
         active.sort(key=lambda s: abs(s.edge_val), reverse=True)
 
-        n_live = sum(1 for s in active if s.live_prob is not None)
-        score_info = f"Live scores: {n_live}" if n_live else f"Scores: {self.last_score_fetch or 'fetching...'}"
-
         table = Table(
             title=(
                 f"🎾 Tennis-Edge Live Monitor  |  {len(active)} active / {len(self.tennis_tickers)} mkts  |  "
-                f"{score_info}  |  Updates: {self.total_updates}  |  {now}"
+                f"Updates: {self.total_updates}  |  {now}"
             ),
             show_lines=False,
         )
         table.add_column("Signal", justify="center", width=8)
-        table.add_column("Player", style="white", width=20)
-        table.add_column("Score", style="cyan", width=12)
-        table.add_column("Bid", justify="right", width=4)
-        table.add_column("Ask", justify="right", width=4)
+        table.add_column("Player", style="white", width=22)
+        table.add_column("Bid", justify="right", width=5)
+        table.add_column("Ask", justify="right", width=5)
         table.add_column("Market", justify="right", width=7)
-        table.add_column("Pre", justify="right", width=5, style="dim")
-        table.add_column("Live", justify="right", width=6)
+        table.add_column("Pre-match", justify="right", width=9)
         table.add_column("Edge", justify="right", width=8)
-        table.add_column("EV/$", justify="right", width=6)
+        table.add_column("EV/$", justify="right", width=7)
         table.add_column("Side", justify="center", width=5)
-        table.add_column("Kelly$", justify="right", width=7)
+        table.add_column("Kelly$", justify="right", width=8)
+        table.add_column("Vol", justify="right", width=8)
+        table.add_column("⏱", justify="right", width=8, style="dim")
 
         for s in active[:30]:
             sig_style = {"STRONG": "bold red", "MODERATE": "yellow", "WEAK": "white"}.get(s.signal, "dim")
@@ -369,28 +254,21 @@ class RealtimeMonitor:
             side_style = "green" if s.side == "YES" else "red" if s.side == "NO" else "dim"
 
             player_short = s.player_name.split()[-1] if s.player_name else s.ticker[-5:]
-
-            # Live prob column: bold if available, dim if using pre-match
-            if s.live_prob is not None:
-                live_str = f"[bold]{s.live_prob*100:.0f}%[/]"
-            else:
-                live_str = "[dim]-[/]"
-
             pre_str = f"{s.pre_match_prob*100:.0f}%" if s.pre_match_prob else "-"
 
             table.add_row(
                 f"[{sig_style}]{s.signal}[/]",
                 player_short,
-                s.live_score_display or "[dim]-[/]",
                 f"{s.yes_bid}" if s.yes_bid else "-",
                 f"{s.yes_ask}" if s.yes_ask else "-",
                 f"{s.market_prob*100:.0f}%",
                 pre_str,
-                live_str,
                 f"[{edge_style}]{s.edge_val*100:+.1f}%[/]",
-                f"{s.ev_per_dollar:+.2f}" if s.effective_prob else "-",
+                f"{s.ev_per_dollar:+.2f}" if s.pre_match_prob else "-",
                 f"[{side_style}]{s.side}[/]",
-                f"${s.kelly_pct * self.balance:.0f}" if s.effective_prob and s.kelly_pct > 0 else "-",
+                f"${s.kelly_pct * self.balance:.0f}" if s.pre_match_prob and s.kelly_pct > 0 else "-",
+                f"{s.volume:,}" if s.volume else "-",
+                s.last_update,
             )
 
         if self.alerts:
