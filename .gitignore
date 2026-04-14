@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Runtime data
+data/raw/
+data/*.db
+data/models/
+data/reports/
+
+# Config with secrets
+config/local.yaml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Env & secrets
+.env
+*.pem
+config/kalshi_private_key.pem
+config/local.yaml
+.DS_Store

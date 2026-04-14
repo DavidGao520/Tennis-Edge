@@ -1,0 +1,59 @@
+database:
+  path: data/tennis_edge.db
+
+data:
+  raw_dir: data/raw
+  sackmann_base_url: https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master
+  match_years_start: 2000
+  match_years_end: 2026
+
+ratings:
+  initial_mu: 1500.0
+  initial_phi: 350.0
+  initial_sigma: 0.06
+  tau: 0.5
+  rating_period_days: 30
+
+model:
+  type: logistic  # or xgboost, lightgbm
+  features:
+    - glicko2
+    - surface
+    - fatigue
+    - h2h
+    - form
+    - tournament
+  train_start_year: 2005
+  test_start_year: 2020
+  artifacts_dir: data/models
+
+strategy:
+  kelly_fraction: 0.25
+  max_bet_fraction: 0.05
+  min_edge: 0.03
+  bankroll: 1000.0
+
+risk:
+  max_position_per_market: 50.0
+  max_total_exposure: 200.0
+  daily_loss_limit: 100.0
+  kill_switch: false
+
+kalshi:
+  base_url: https://api.elections.kalshi.com/trade-api/v2
+  demo_base_url: https://demo-api.kalshi.co/trade-api/v2
+  api_key_id: ""                               # set via env: TENNIS_EDGE__KALSHI__API_KEY_ID
+  private_key_path: ""                          # set via env: TENNIS_EDGE__KALSHI__PRIVATE_KEY_PATH
+  use_demo: false
+  paper_mode: true
+
+logging:
+  level: INFO
+  file: data/tennis_edge.log
+
+backtest:
+  start_year: 2015
+  end_year: 2024
+  initial_bankroll: 10000.0
+  reports_dir: data/reports
+  retrain_interval_days: 180
