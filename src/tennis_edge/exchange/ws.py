@@ -217,14 +217,22 @@ class KalshiWebSocket:
         if msg_type == "ticker":
             if self.on_ticker:
                 data = msg.get("msg", {})
+
+                # Parse dollar strings to cents (int)
+                def to_cents(val) -> int | None:
+                    if val is None:
+                        return None
+                    try:
+                        return int(round(float(val) * 100))
+                    except (ValueError, TypeError):
+                        return None
+
                 update = TickerUpdate(
                     ticker=data.get("market_ticker", ""),
-                    yes_bid=data.get("yes_bid"),
-                    yes_ask=data.get("yes_ask"),
-                    no_bid=data.get("no_bid"),
-                    no_ask=data.get("no_ask"),
-                    last_price=data.get("last_price"),
-                    volume=data.get("volume"),
+                    yes_bid=to_cents(data.get("yes_bid_dollars")),
+                    yes_ask=to_cents(data.get("yes_ask_dollars")),
+                    last_price=to_cents(data.get("price_dollars")),
+                    volume=int(float(data.get("volume_fp", 0) or 0)),
                     ts=data.get("ts", 0),
                 )
                 await self.on_ticker(update)
