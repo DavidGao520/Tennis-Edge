@@ -137,6 +137,10 @@ src/tennis_edge/
     └── time.py         # Date helpers
 ```
 
+## Documentation
+
+- [Progress log](docs/PROGRESS.md) — timeline, current state, known limitations, and next steps.
+
 ## License
 
 MIT
