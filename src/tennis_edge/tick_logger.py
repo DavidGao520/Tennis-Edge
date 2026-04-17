@@ -43,9 +43,11 @@ TENNIS_PREFIXES = (
     "KXWTACHALLENGERMATCH",
 )
 
-# Buffer policy.
-FLUSH_INTERVAL_S = 5.0
-FLUSH_BATCH_SIZE = 100
+# Buffer policy. Flush whichever comes first. Larger batches = fewer SQLite
+# writes = lower disk I/O. Trade-off: a hard crash could lose up to
+# FLUSH_INTERVAL_S of buffered ticks (acceptable on Mac mini with autorestart).
+FLUSH_INTERVAL_S = 30.0
+FLUSH_BATCH_SIZE = 500
 
 
 @dataclass
