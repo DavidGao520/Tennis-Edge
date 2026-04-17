@@ -63,12 +63,30 @@ CREATE TABLE IF NOT EXISTS glicko2_ratings (
 );
 """
 
+# Phase 2 — Real Backtest infrastructure.
+# Logs every WebSocket ticker update for tennis markets so we can replay
+# real Kalshi prices in backtest engine instead of synthetic odds.
+MARKET_TICKS_DDL = """
+CREATE TABLE IF NOT EXISTS market_ticks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    yes_bid INTEGER,
+    yes_ask INTEGER,
+    last_price INTEGER,
+    volume INTEGER,
+    received_at INTEGER NOT NULL
+);
+"""
+
 INDEXES_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(tourney_date);",
     "CREATE INDEX IF NOT EXISTS idx_matches_winner ON matches(winner_id);",
     "CREATE INDEX IF NOT EXISTS idx_matches_loser ON matches(loser_id);",
     "CREATE INDEX IF NOT EXISTS idx_rankings_player_date ON rankings(player_id, ranking_date);",
     "CREATE INDEX IF NOT EXISTS idx_glicko2_player ON glicko2_ratings(player_id, as_of_date);",
+    "CREATE INDEX IF NOT EXISTS idx_ticks_ticker_ts ON market_ticks(ticker, ts);",
+    "CREATE INDEX IF NOT EXISTS idx_ticks_received_at ON market_ticks(received_at);",
 ]
 
-ALL_DDL = [PLAYERS_DDL, MATCHES_DDL, RANKINGS_DDL, GLICKO2_RATINGS_DDL] + INDEXES_DDL
+ALL_DDL = [PLAYERS_DDL, MATCHES_DDL, RANKINGS_DDL, GLICKO2_RATINGS_DDL, MARKET_TICKS_DDL] + INDEXES_DDL

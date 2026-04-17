@@ -560,6 +560,29 @@ def monitor(ctx: click.Context) -> None:
         console.print("\n[yellow]Monitor stopped.[/yellow]")
 
 
+@main.command(name="log-ticks")
+@click.pass_context
+def log_ticks(ctx: click.Context) -> None:
+    """Stream Kalshi WebSocket tennis ticks to SQLite (market_ticks table).
+
+    Run continuously (e.g. inside tmux/screen). Each day this is not running
+    is a day of real backtest data we can never recover.
+    """
+    import asyncio
+    from .tick_logger import TickLogger
+
+    cfg = ctx.obj["config"]
+    tl = TickLogger(cfg)
+
+    console.print("[bold]Starting Kalshi tick logger (tennis only)...[/bold]")
+    console.print("[dim]Writing to market_ticks table. Press Ctrl+C to stop.[/dim]\n")
+
+    try:
+        asyncio.run(tl.run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Tick logger stopped.[/yellow]")
+
+
 @main.command()
 @click.argument("player_name")
 @click.pass_context
