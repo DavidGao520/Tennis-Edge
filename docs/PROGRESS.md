@@ -214,3 +214,86 @@ src/tennis_edge/
 5. **Challenger live scores** — integrate paid API for point-level data on challenger matches
 6. **Position tracking dashboard** — show open positions, unrealized P&L alongside monitor
 7. **Backtest against actual Kalshi historical odds** — currently backtesting uses synthetic odds, need real historical market prices
+
+---
+
+# Phase 2: Three-Option Trader Assistant (started April 17, 2026)
+
+## What Changed The Plan
+
+A live demo on April 17 surfaced the real ceiling of phase 1: monitor showed Holmgren 53% pre-match while Kalshi market priced him at 15% live (he had lost first set 6-3 and was down 1-0). Bot has no live score awareness and over-weights player rating difference. **Bot is not trustworthy enough to bet on.**
+
+The honest truth: David's $10K/month manual edge on Kalshi tennis comes from screenshot-driven analysis (with Gemini 3.1 Pro doing structured EV reasoning over live score + market price), not from the trained model. Tennis-Edge's job in phase 2 is to **make that workflow faster and more reliable**, not to replace David's judgment.
+
+## Phase 2 Plan: Three-Option Trader Assistant (6 weeks)
+
+Single launch screen, three options, three workstreams (one per teammate):
+
+```
+$ tennis-edge
+
+  Tennis-Edge — Kalshi Tennis Trading Assistant
+
+  [1] Arbitrage    — Cross-market price discrepancy scanner (real-time auto-orders)
+  [2] Monitor      — Pre-match anchor + Kalshi live prices + LLM research (manual trade)
+  [3] Agent        — Bot scans → LLM analyzes → recommend or auto-execute (with rails)
+```
+
+| Owner | Workstream | Status |
+|---|---|---|
+| **David** | LLM Research Enrichment + Agent (Option 2 R-key + Option 3) | In progress |
+| **Anthony** | CLI / UI polish + Real Backtest infrastructure | In progress |
+| **Billy** | Arbitrage scanner (with feasibility gate Week 1) | Feasibility study pending |
+
+Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact in private plan file. Key design decisions:
+
+- **Agent has 3 sequential safety phases**: shadow-trade (log only) → human-in-loop (Y/N/R prompt) → restricted auto-execute (only if shadow phase shows agent matches/beats David's manual trades)
+- **Hard kill switches always on**: `Q` pauses agent, `K` flattens all agent positions
+- **LLM choice**: Gemini 3.1 Pro (validated by David) + Claude Opus 4.6 (A/B test for deep dives)
+- **Real backtest** replaces synthetic odds with WebSocket-collected historical Kalshi prices
+- **Arbitrage path has feasibility gate**: if no actionable signals in week 1 study, Billy pivots to backtest support
+
+## Phase 2 Progress Log
+
+### April 17, 2026 — Tick Logger Shipped (Day 1)
+
+**Built**: `tennis-edge log-ticks` — Kalshi WebSocket tick streaming to SQLite (`market_ticks` table)
+
+- New table `market_ticks(id, ticker, ts, yes_bid, yes_ask, last_price, volume, received_at)` with indexes on `(ticker, ts)` and `received_at`
+- Async logger filters to tennis markets only (4 series prefixes: KXATPMATCH, KXATPCHALLENGERMATCH, KXWTAMATCH, KXWTACHALLENGERMATCH)
+- Buffered writes: flushes every 30s OR every 500 rows whichever first (was initially 5s/100, raised to reduce I/O after deployment)
+- Graceful SIGINT/SIGTERM handling with final buffer flush
+- 60-second stats heartbeat for visibility on long-running deployments
+
+**Deployment**: Running on Mac mini (not MacBook, which sleeps when David closes the lid).
+- Mac mini config: `pmset sleep=0 disksleep=0 autorestart=1` so it survives power cuts and never sleeps
+- Inside `tmux new -s ticks` so SSH disconnects don't kill it
+- Verified producing data: 60s smoke test = 59 ticks across active markets, ~1 tick/sec at off-peak (will spike to 100s/sec during peak match hours)
+
+**Why this is the critical path**: Every day the logger is not running is a day of real Kalshi price data Anthony's backtest engine can never recover. Phase 1 backtest used synthetic odds; phase 2 demo credibility depends entirely on this dataset accumulating cleanly.
+
+**Branch**: All phase 2 work on `phase-2` branch. `main` stays stable. Teammates work in their own forks.
+
+## Phase 2 — Open Workstreams
+
+### David
+- [x] Tick logger (technically Anthony's workstream but David built it Day 1 to start data accumulation)
+- [ ] Agent shadow-trade logging skeleton (`agent_decisions` table + writer)
+- [ ] Gemini API client + structured EV prompt v1
+- [ ] LLM research R-key in monitor
+
+### Anthony
+- [ ] Monitor layout redesign (multi-panel: market list / detail / research / positions)
+- [ ] Onboarding wizard (first-run flow: ingest → train → first paper trade)
+- [ ] Real backtest engine consuming `market_ticks` data
+
+### Billy
+- [ ] Arbitrage feasibility study (Week 1 gate): pull Kalshi + Polymarket tennis orderbooks, check 3 arb types (cross-venue, intra-Kalshi YES/NO sum, related-market consistency). Decision criteria: ≥5 actionable signals/day with >$5 expected profit each → continue. Else pivot to backtest support.
+
+## Phase 2 — Premises Being Tested
+
+1. **Tennis arb opportunities exist on Kalshi at meaningful frequency.** UNVERIFIED — Billy's week 1 study confirms or pivots.
+2. **LLM with screenshot + structured prompt produces useful EV analysis.** PARTIALLY VERIFIED ($10K/month with Gemini). Agent shadow-trade phase tests reproducibility without human judgment in loop.
+3. **5 weeks of WebSocket-collected Kalshi prices = sufficient sample for credible backtest.** Reasonable for high-volume markets, marginal for Challengers. Acceptable.
+4. **3 teammates can ship 3 distinct workstreams in 5-6 weeks while integrating cleanly.** Tight. Week 5 reserved for integration. Option 1 has built-in fallback if it fails.
+5. **David's $10K/month manual edge is reproducible signal, not variance.** 275 trades, +5.9% ROI is moderate evidence. Not pure luck given consistency across categories.
