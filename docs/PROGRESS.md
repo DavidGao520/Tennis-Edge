@@ -255,6 +255,32 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 18, 2026 — Agent Lane 1A: Decision Log (JSONL Append-Only)
+
+**Built**: `src/tennis_edge/agent/` package with `decisions.py` — schemas + JSONL writer. This is the foundation; everything else in Lane 1 (`llm.py`, `safety.py`, `loop.py`) imports from here.
+
+Two schemas:
+- `EvAnalysis` — parsed LLM output (edge_estimate ∈ [0,1], recommendation ∈ {BUY_YES, BUY_NO, SKIP}, confidence, reasoning ≤ 2000 chars, up to 5 key_factors). Parse failure = LLM failure for the 3x-consecutive kill switch in Lane 1D.
+- `AgentDecision` — full record with decision_id (join key), model_pre_match, market_yes_cents, edge_at_decision, llm_provider + llm_prompt_hash + llm_raw_output, analysis, mode ∈ {shadow, human_in_loop, auto}, executed + order_id + edge_at_execution.
+
+Two JSONL files, both append-only with fsync:
+- `data/agent_decisions.jsonl` — one line per model→LLM cycle
+- `data/agent_settlements.jsonl` — one line per settled market, written later by the settlement poller (Lane G), joined on decision_id
+
+**Why two files instead of rewriting one**: append-only is crash-safe (O_APPEND is atomic per small write on POSIX), the poller runs on its own schedule, and `replay()` does the join at read time. Rewriting JSONL rows to backfill `outcome_at_settle` is how you lose data.
+
+**Why JSONL instead of SQLite**: Phase 3A expects ~20 decisions/day × 6 weeks ≈ 840 rows. Flat file is cheaper than a schema migration and stays greppable. Promote only when indexed queries are actually needed.
+
+**Durability**: every append fsyncs before return. An agent that can lose audit records to power loss is an agent you cannot trust.
+
+**Also shipped**: `prompt_hash(template, inputs)` — stable 16-char sha256 for A/B-grouping decisions by prompt version. Survives dict key reordering (sort_keys=True in JSON encoding).
+
+**Tests**: `tests/test_agent_decisions.py` — 25 cases across schema validation (8), round-trip + ordering (4), replay + out-of-order settlement join (3), tolerance for blank lines / malformed lines / missing files / nested parent dirs (4), and prompt_hash determinism (6).
+
+Full suite: 65 passed (40 prior + 25 new).
+
+**Plan context**: Lane 1A per Phase 2 eng review. Dependency for 1E (`llm.py` fills in `analysis`), 1D (`safety.py` counts parse failures), 1F (`loop.py` appends), G (poller appends settlements). Nothing in Lane 1 can land until this does — it's the data contract for the whole agent.
+
 ### April 18, 2026 — Agent Lane C: WebSocket Health Timestamps
 
 **Built**: `KalshiWebSocket` now exposes two monotonic timestamps for the Phase 2 agent safety watchdog.
