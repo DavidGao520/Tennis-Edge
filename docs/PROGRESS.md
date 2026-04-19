@@ -255,6 +255,45 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Agent Lane 1D: Safety Module (5 Kill Switches + File-Flag IPC)
+
+**Built**: `src/tennis_edge/agent/safety.py` — owns agent run-state (`RUNNING` / `PAUSED` / `KILLED`) and evaluates every kill switch from Lane B, Lane C, Lane 1A, and Lane 1E.
+
+**Kill switches** (any one flips `RUNNING` → `KILLED`, terminal):
+1. `LLM_CONSECUTIVE_FAILURES` — 3 in a row, any `LLMError` subclass. `record_llm_success()` resets the counter.
+2. `WS_RECONNECT_STARVATION` — `seconds_since_last_connect > 60` (or `None` = never connected). Reads `last_connect_ts` from Lane C.
+3. `WS_STALE_WITH_LIVE_MATCH` — `seconds_since_last_message > 60` AND caller-provided `live_match_fn()` returns True. Supports sync or async predicate. Quiet nights with no matches do not trip.
+4. `TICK_LOGGER_STALE` — `SELECT MAX(received_at) FROM market_ticks` via read-only SQLite URI; if > 60s old, empty, missing table, or missing DB, trip. This is the 5th kill switch added during the eng review (not in the original plan).
+5. `BUDGET_EXCEEDED` — any configured provider has `remaining_usd <= 0`. Mirrors Lane 1E's pre-flight `BudgetExceeded` but at the daemon level so the agent exits instead of silently rejecting every candidate.
+6. `DAILY_LOSS_LIMIT` — `risk.state.daily_pnl <= -limit` (default $200). Lane B's RiskManager trips its own internal kill; this mirrors it at the agent layer for clean shutdown.
+7. `USER_FLATTEN` — flatten flag file present. Daemon responsibility: close agent-owned positions, then `clear_flatten_flag()` before exit.
+
+**File-flag IPC** (CLI writer, daemon reader):
+- `data/agent_control/pause` — exists = `PAUSED`, deleted = `RUNNING` (reversible, re-checked every watchdog tick).
+- `data/agent_control/flatten` — exists = trip `USER_FLATTEN`. Flatten takes precedence over pause.
+- Helpers: `touch_pause_flag`, `clear_pause_flag`, `touch_flatten_flag`, `clear_flatten_flag`. All tolerate missing files.
+
+**Watchdog loop** (`watchdog_loop`) runs the checks in order: user flags → budget → daily P&L → WS health → tick-logger. Short-circuits when `PAUSED` so a user pausing during a known-bad condition (market close, mid-maintenance) cannot trip a reversible pause into a terminal kill. Exits cleanly once `is_killed()` flips.
+
+**Trip idempotency**: first trip wins. `_trip_once` is lock-guarded; subsequent attempts are no-ops. `KILLED` is terminal — clearing the pause flag cannot resurrect a killed daemon.
+
+**Dep typing**: deps (WS, budget, risk manager, DB path) come in as structural `Protocol`s so tests use minimal duck-typed fakes. Real wiring happens in Lane 1F / Lane H.
+
+**Tests**: `tests/test_agent_safety.py` — 28 cases.
+- Initial state (1)
+- LLM counter: trips at threshold, success resets (2)
+- WS: reconnect starvation, never connected, stale+live match trip, stale without live match does not, async predicate, fresh does not trip (6)
+- Tick logger: fresh OK, stale trips, empty table, missing DB, missing table (5)
+- Budget: exceeded trips, remaining OK (2)
+- Daily P&L: limit trips, within limit OK, positive P&L OK (3)
+- File-flag IPC: pause sets/clears, flatten trips, flatten beats pause, cleanup tolerates missing (5)
+- Trip idempotency: first trip wins, KILLED terminal (2)
+- `watchdog_loop`: exits when killed, skips checks while paused (2)
+
+Full suite: 113 passed (85 prior + 28 new).
+
+**Plan context**: Lane 1D per Phase 2 eng review. Depends on Lane B (RiskManager), Lane C (WS timestamps), Lane 1A (LLMError hierarchy), Lane 1E (BudgetTracker). Blocks Lane 1F (`agent/loop.py` — worker needs the monitor to gate candidates).
+
 ### April 19, 2026 — Agent Lane 1E: LLM Provider + Budget Tracker
 
 **Built**: `src/tennis_edge/agent/llm.py` — provider abstraction, real Gemini implementation, persistent per-month budget enforcement, structured JSON output via response_schema.
