@@ -255,6 +255,25 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 18, 2026 — Agent Lane B: RiskManager Race Fix
+
+**Built**: Concurrency-safe `RiskManager` in `strategy/risk.py`. Pre-existing TOCTOU race between `check_trade` and `record_trade` would have let two concurrent agent candidates both pass the limit check and both record, producing combined exposure above the configured caps. With Phase 2's LLM-worker queue about to exercise this path for real, the fix had to land before any agent executor code.
+
+- New atomic API: `await mgr.check_and_reserve(decision)` validates and records under a single `asyncio.Lock`. Returns `(allowed, reason)`.
+- `await mgr.release(decision)` unwinds a reservation when the downstream order fails. Idempotent — safe to call after settlement cleared the position, and safe to call twice without going negative.
+- `record_settlement` and `reset_daily` are now async and locked. `summary()` stays sync (read-only snapshot).
+- Deprecated split API (`check_trade` / `record_trade`) removed. Grep confirmed zero callers in the codebase, so clean delete.
+
+**Tests**: `tests/test_risk_concurrency.py` — 10 cases. The regression test (`test_concurrent_reserve_respects_per_market_cap`) races 10 candidates through `asyncio.gather`; before the fix, all 10 would be admitted. After the fix, exactly 2 are admitted and final exposure matches the cap.
+
+Full suite: 30 passed (20 existing + 10 new).
+
+**Plan context**: Per Phase 2 eng review, this is Lane B — independent of the agent spine and of Lane C (WS timestamps). Landing first unblocks `agent/loop.py` without requiring agent code to also ship the race fix. Review doc decisions locked:
+- Tick source: DB tail from `market_ticks` (single-writer, many-reader)
+- Runtime: headless CLI daemon (`tennis-edge agent start/pause/flatten`)
+- Phase 3A LLM input: text-only structured prompt (screenshots deferred to 3B)
+- Decision log: JSONL append-only
+
 ### April 17, 2026 — Tick Logger Shipped (Day 1)
 
 **Built**: `tennis-edge log-ticks` — Kalshi WebSocket tick streaming to SQLite (`market_ticks` table)
