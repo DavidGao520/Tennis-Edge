@@ -255,6 +255,42 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Phase 3A First Real Run (Mac Mini Smoke Test)
+
+**Bootstrapped Mac mini** with Phase 1 data via `scripts/macmini_bootstrap.sh`:
+- `git pull origin phase-2` (all 10 Phase 2 commits).
+- `pip install -e '.[agent]'` installed `google-genai` 1.73.
+- 114 MB `phase1_data.db` `scp`'d from MacBook, imported via `scripts/import_phase1_data.py`. Final counts on Mac mini: players 66,010 / matches 78,762 / rankings 1,340,288 / glicko2_ratings 46,898 / **market_ticks 613,342 preserved** (tick-logger's tmux session ran uninterrupted the whole time).
+- `data/models/latest.joblib` (3.8 KB logistic model) placed.
+- `.env` populated with `TENNIS_EDGE_GEMINI_KEY`.
+- `pytest` 179 passed on Mac mini (same as MacBook).
+
+**First live agent run** (`tennis-edge agent start --min-edge 0.15`, ~3 minutes):
+- ✅ End-to-end pipeline works. No crashes, no kill-switch trips.
+- ✅ 22 decisions written to `data/agent_decisions.jsonl`.
+- ✅ 13 real Gemini 3.1 Pro Preview calls (the other 9 candidates were filtered pre-LLM: stale queue, budget reserve, or edge collapsed before dequeue).
+- ✅ Post-LLM edge re-check firing: one example logged `edge=-0.369 → -0.429 rec=BUY_NO` on a WTA challenger, showing the re-validation path is exercised.
+- ✅ BudgetTracker persisted state correctly across the run.
+
+**Cost finding** (the surprise of the day):
+- 13 calls / 3 min = **$0.1391 total ≈ $0.0107 per call** — matches the single-call smoke test from Lane 1E exactly, so pricing is predictable, not a bug.
+- Extrapolated: **$2.80/hr, $67/day, ~$2,000/month at `--min-edge 0.15`.**
+- The configured monthly cap of $50 would trip `BUDGET_EXCEEDED` in about 18 hours at this rate.
+- Root cause: `--min-edge 0.15` combined with illiquid Challenger markets (wide bid/ask spreads drive |edge| above threshold easily) produced a candidate every ~14 seconds. The planned `--min-edge 0.08` would only increase this.
+
+**Decision**: paused before any long run. Threshold / cooldown / budget calibration deferred to tomorrow. The 22 existing decisions are kept for analysis (will read them tomorrow morning to judge LLM reasoning quality before touching knobs).
+
+**Likely Phase 3A operating config** (to be verified tomorrow):
+- `--min-edge 0.12` or `0.15` (wait for empirical candidate-rate data)
+- `--cooldown 1800` (30 min per ticker, up from 5 min)
+- `--gemini-budget 100-200` (top up API balance)
+
+**Also shipped today**:
+- `scripts/import_phase1_data.py` — idempotent SQLite DELETE+INSERT for Phase 1 tables, never touches `market_ticks`.
+- `scripts/macmini_bootstrap.sh` — one-shot Mac mini setup wrapping git pull + pip install + model placement + .env init + data import + pytest.
+
+**Operational learning**: `tennis-edge` CLI is only on PATH inside the venv. Either `source .venv/bin/activate` before using or `ln -s ~/Tennis-Edge/.venv/bin/tennis-edge /usr/local/bin/tennis-edge` for a global shim. The agent start command must be run inside the venv either way (for the import path).
+
 ### April 19, 2026 — Agent Lane H: CLI + Runtime Wiring (Phase 3A Ready to Run)
 
 **Built**: `src/tennis_edge/agent/runtime.py` (real `model_prob_fn` + `context_builder` wired to existing Glicko-2 stack) + CLI command group `tennis-edge agent`.
