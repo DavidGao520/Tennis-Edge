@@ -255,6 +255,24 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 18, 2026 — Agent Lane C: WebSocket Health Timestamps
+
+**Built**: `KalshiWebSocket` now exposes two monotonic timestamps for the Phase 2 agent safety watchdog.
+
+- `last_message_ts` — set on every decoded frame (ticker, orderbook, trade, fill, subscribed, error — all count). Cleared to `None` on disconnect so a stale pre-disconnect reading cannot mask an outage.
+- `last_connect_ts` — set after a successful WebSocket upgrade. Preserved across disconnects so the watchdog can detect reconnect-loop starvation independently of message traffic.
+- Helpers: `seconds_since_last_message()` and `seconds_since_last_connect()` return `None` or wall seconds. No locking needed — scalar read/write is atomic under the GIL and readers only compare against `time.monotonic()`.
+
+**Why two timestamps, not one**: the original plan said "auto-pause if WebSocket disconnects > 60 seconds" but that conflates two distinct failure modes. Quiet nights have no ticker traffic by design — treating silence as an outage would trip false positives. The agent safety module will combine these two signals with an "is any match live" predicate:
+- `seconds_since_last_connect > 60` → link is down, pause regardless of match state.
+- `seconds_since_last_message > 60` AND live match in progress → link is up but the ticker stream went silent during play, pause.
+
+**Tests**: `tests/test_ws_timestamps.py` — 10 cases. Drives `_handle_message` directly with synthetic frames; no real socket needed. The last case (`test_watchdog_shape_healthy_then_stale`) walks the exact state sequence the safety watchdog will see and asserts the timestamps behave the way that watchdog expects.
+
+Full suite: 40 passed (30 prior + 10 new).
+
+**Plan context**: Lane C of Phase 2 eng review. Independent of Lane B (risk race) and Lane 1 (agent spine). Landing before `agent/safety.py` so the safety module can build on a stable timestamp API instead of monkey-patching ws.py.
+
 ### April 18, 2026 — Agent Lane B: RiskManager Race Fix
 
 **Built**: Concurrency-safe `RiskManager` in `strategy/risk.py`. Pre-existing TOCTOU race between `check_trade` and `record_trade` would have let two concurrent agent candidates both pass the limit check and both record, producing combined exposure above the configured caps. With Phase 2's LLM-worker queue about to exercise this path for real, the fix had to land before any agent executor code.

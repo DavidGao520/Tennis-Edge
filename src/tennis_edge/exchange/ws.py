@@ -116,6 +116,52 @@ class KalshiWebSocket:
         self._subscriptions: list[dict] = []
         self._running = False
 
+        # Health timestamps for Phase 2 agent safety watchdog.
+        #
+        # last_message_ts  — monotonic time of the most recent message we
+        #                    successfully decoded. Reset to None on
+        #                    disconnect. Safety rule: stale message time
+        #                    is only meaningful when we know a match is
+        #                    live; quiet nights have no ticker traffic
+        #                    by design. Consumer must combine this with
+        #                    an "is any market live" check.
+        #
+        # last_connect_ts  — monotonic time of the most recent successful
+        #                    connect. Updated after the WebSocket upgrade
+        #                    completes. Safety rule: if the reconnect
+        #                    loop has not succeeded in 60s we consider
+        #                    the exchange link down regardless of
+        #                    whether any match is live.
+        #
+        # Both are plain floats read by separate coroutines. No lock
+        # needed — scalar read/write is atomic under the GIL and the
+        # watchdog only compares against time.monotonic().
+        self.last_message_ts: float | None = None
+        self.last_connect_ts: float | None = None
+
+    def seconds_since_last_message(self) -> float | None:
+        """Wall seconds since the last decoded message.
+
+        Returns None if no message has ever been received, or if we are
+        currently in the reconnect loop (last_message_ts is cleared on
+        disconnect). Callers should treat None as "unknown, assume
+        stale" when a match is known to be live.
+        """
+        if self.last_message_ts is None:
+            return None
+        return time.monotonic() - self.last_message_ts
+
+    def seconds_since_last_connect(self) -> float | None:
+        """Wall seconds since the last successful WebSocket upgrade.
+
+        Returns None if we have never connected. Preserved across
+        disconnects so the safety watchdog can detect reconnect-loop
+        starvation independently of message traffic.
+        """
+        if self.last_connect_ts is None:
+            return None
+        return time.monotonic() - self.last_connect_ts
+
     def subscribe_ticker(self) -> None:
         """Subscribe to ticker updates for ALL markets."""
         self._subscriptions.append({"channels": ["ticker"]})
@@ -147,9 +193,16 @@ class KalshiWebSocket:
                 await self._connect_and_stream()
             except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
                 logger.warning("WebSocket disconnected: %s. Reconnecting in %ds...", e, RECONNECT_DELAY)
+                # Clear last_message_ts so a reader polled during the
+                # reconnect window sees "no recent message" (returning
+                # the pre-disconnect timestamp would mask the outage).
+                # last_connect_ts is preserved so the watchdog can
+                # detect how long we've been in the reconnect loop.
+                self.last_message_ts = None
                 await asyncio.sleep(RECONNECT_DELAY)
             except Exception as e:
                 logger.error("WebSocket error: %s. Reconnecting in %ds...", e, RECONNECT_DELAY)
+                self.last_message_ts = None
                 await asyncio.sleep(RECONNECT_DELAY)
 
     async def disconnect(self) -> None:
@@ -175,6 +228,7 @@ class KalshiWebSocket:
             ssl=ssl_ctx,
         ) as ws:
             self._ws = ws
+            self.last_connect_ts = time.monotonic()
             logger.info("WebSocket connected")
 
             if self.on_connect:
@@ -212,6 +266,12 @@ class KalshiWebSocket:
 
     async def _handle_message(self, msg: dict) -> None:
         """Route incoming messages to callbacks."""
+        # Health timestamp: every decoded message, regardless of type,
+        # counts as the link being alive. Includes "subscribed" and
+        # "error" frames — a server-side error is still proof the TCP
+        # stream is flowing.
+        self.last_message_ts = time.monotonic()
+
         msg_type = msg.get("type", "")
 
         if msg_type == "ticker":
