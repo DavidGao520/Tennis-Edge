@@ -255,6 +255,48 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Agent Lane G: Settlement Poller (Counterfactual P&L)
+
+**Built**: `src/tennis_edge/agent/settlement.py` — closes the loop on Phase 3A analytics by backfilling `agent_settlements.jsonl` with counterfactual P&L per decision.
+
+**The question this answers**: "If the agent had executed its recommendations, what would the P&L have been?" That's the single metric that decides whether Phase 3A promotes to 3B.
+
+**Approach**:
+1. Read all decisions + all existing settlements from the JSONL files
+2. For each decision without a matching settlement, look up the Kalshi market
+3. If `status in {"settled", "finalized"}`, compute counterfactual P&L at fixed notional and append a `SettlementRecord`
+4. Idempotent: re-running never double-counts
+
+**Counterfactual P&L math** (`counterfactual_pnl(rec, market_yes_cents, result, notional=$50)`):
+- `BUY_YES` + YES wins: bought at P cents, $50 notional → `int($50 * 100 / P)` contracts, each pays $1, profit = `contracts * (100-P)/100`
+- `BUY_YES` + NO wins: full stake lost, `-$50`
+- `BUY_NO` + NO wins: symmetric (buys NO at `100-P` cents)
+- `BUY_NO` + YES wins: `-$50`
+- `SKIP` + any outcome: outcome recorded, `pnl=0` (no counterfactual trade). Still settled so replay analytics can ask "what fraction of SKIPs would have been profitable?"
+- Void market (status settled, result empty): outcome=void, pnl=0 regardless of recommendation
+- Degenerate fill prices (0c, 100c): outcome recorded, pnl=0 instead of dividing by zero
+
+**Default notional $50** matches the Phase 3C position cap from the plan — lets shadow-mode numbers translate directly to expected 3C P&L without rescaling.
+
+**Poller runtime**:
+- `SettlementPoller(log, exchange, config)` with structural typing on `exchange` — accepts anything with `async get_market(ticker) -> Market`. Real `KalshiClient` in prod, `FakeExchange` in tests, no factory needed.
+- `poll_once()` dedups decisions by ticker so one REST call resolves all decisions on the same market.
+- `per_market_delay_s` (default 0.2s) keeps us under Kalshi's rate limit on backlogs.
+- `run()` loops at `poll_interval_s` (default 900s = 15 min; matches the rough window between match end and Kalshi settlement).
+- `request_stop()` short-circuits mid-loop and mid-poll.
+- Exchange exceptions are logged and skipped per-ticker — one bad market doesn't halt the scan.
+
+**Tests**: `tests/test_agent_settlement.py` — 21 cases.
+- `counterfactual_pnl` math for every (rec, result) cell: BUY_YES/NO win/lose, SKIP, void, unknown result, degenerate prices, default notional, unknown recommendation warning (10)
+- `poll_once`: writes for resolved market, skips non-terminal, idempotent for already-settled, handles exception per-ticker, void market, multiple decisions same ticker deduped, SKIP settles without P&L, "finalized" status also terminal, no-unresolved returns 0, stop short-circuits (10)
+- `run()` loop exits on stop (1)
+
+Full suite: 158 passed (137 prior + 21 new).
+
+**Plan context**: Lane G per Phase 2 eng review. Independent of the main agent loop — can run in its own daemon or alongside. Phase 3A end-to-end metrics are now computable: `DecisionLog.replay()` joins decisions to settlements, analytics can compute win rate, ROI, and SKIP counterfactuals.
+
+**Remaining: Lane H (CLI).** `tennis-edge agent start/pause/flatten/status`, real `model_prob_fn` + `context_builder` wired to the existing Glicko-2 DB. Then the daemon can actually run on the Mac mini.
+
 ### April 19, 2026 — Agent Lane 1F: Main Loop (Shadow Mode)
 
 **Built**: `src/tennis_edge/agent/loop.py` — the agent spine. Ties every prior lane together into a single-worker, bounded-queue, DB-tailing shadow-trade loop.
