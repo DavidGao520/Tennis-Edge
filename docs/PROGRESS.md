@@ -255,6 +255,49 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Agent Lane 1F: Main Loop (Shadow Mode)
+
+**Built**: `src/tennis_edge/agent/loop.py` — the agent spine. Ties every prior lane together into a single-worker, bounded-queue, DB-tailing shadow-trade loop.
+
+**Components**:
+- `MarketTickReader` — tails `market_ticks` via read-only SQLite URI. `latest_per_ticker()` returns one row per ticker since cursor (GROUP BY + MAX inside a subquery), cursor advances on each poll. `latest_for_ticker()` point-lookup for post-LLM edge re-check. `price_cents()` preference: `last_price → mid(bid,ask) → ask → bid → None`.
+- `Candidate` dataclass — `decision_id` (UUID4 first 12 hex), ticker, `model_prob`, `market_yes_cents`, `edge_at_decision`, `enqueued_at` (monotonic).
+- `AgentLoop.run()` — spawns `_reader_loop` + `_worker_loop`, waits on stop event OR `safety.is_killed()`, clean cancel on shutdown.
+
+**Enqueue gating** (all must pass):
+1. Cooldown: per-ticker, default 300s, started the moment we enqueue (not when LLM returns) to prevent same-market spam while LLM is working.
+2. Price decodable: `price_cents(row)` not None.
+3. `model_prob_fn(ticker)` returns a float (None = unknown ticker, skip).
+4. `abs(edge) >= min_edge` (default 0.08 = 8pp, higher than Phase 1 scanner's 3% — only burn LLM dollars on real signals).
+5. Queue not full: `queue_max` default 20, overflow drops with warning.
+
+**Worker path** (single coroutine):
+1. Safety check: `is_running()`? Skip if paused or killed.
+2. Freshness gate: age > `max_candidate_age_s` (default 60s) → drop without LLM call.
+3. `context_builder(ticker, model_prob, market_yes_cents)` → `PromptContext` or None. None = skip without counting as LLM failure (context unavailable ≠ LLM error).
+4. `llm.analyze(ctx)` — catches `BudgetExceeded`, `LLMError`, bare `Exception`. All three route through `safety.record_llm_failure` so the 3x kill switch counts.
+5. On success: `safety.record_llm_success()` resets the counter.
+6. Post-LLM edge re-check: re-read latest tick, compute `edge_at_execution`. If `abs(edge_at_execution) < stale_edge_threshold`, set `reject_reason="edge_stale"`.
+7. Append `AgentDecision` — in Phase 3A shadow mode, `executed=False` always. Edge-stale decisions are still logged so shadow analytics can measure LLM latency's cost in missed signals.
+
+**Helpers for testing** (not wired into production paths): `tick_once()` single poll, `drain_once()` single candidate handoff, `cooldown_remaining(ticker)`. Enabled deterministic tests — no asyncio race flakes.
+
+**What's NOT in this lane**:
+- Executor (Phase 3B adds `human_in_loop` prompt + order placement; 3C adds restricted auto)
+- Settlement poller (Lane G, separate)
+- CLI wrapper (Lane H)
+- Screenshot pipeline (deferred to Phase 3B per eng review Fork #3)
+
+**Tests**: `tests/test_agent_loop.py` — 24 cases. Drive-deterministic via real SQLite `market_ticks` + controlled inserts + `tick_once()` / `drain_once()`. Covers:
+- Tick reader: latest-per-ticker, cursor advance, price preference, missing DB (6)
+- Enqueue gating: edge threshold, unknown ticker, no prices, cooldown block, cooldown=0 allows requeue, queue cap drop (7)
+- Worker: paused skip, stale-candidate drop, context=None skip (no LLM failure), happy path logs decision, LLM failure increments counter, 3x failures trip kill switch, post-LLM edge stale → reject, post-LLM edge holds → no reject, killed-between-enqueue-and-dequeue skip, shadow mode never sets executed (10)
+- `cooldown_remaining` (1)
+
+Full suite: 137 passed (113 prior + 24 new).
+
+**Plan context**: Lane 1F per Phase 2 eng review. Depends on all five prior lanes (B, C, 1A, 1E, 1D). With this lane shipped, the Phase 3A shadow-trade pipeline is code-complete. Remaining: Lane G (settlement poller to backfill outcomes) and Lane H (CLI `agent start/pause/flatten/status` so it can actually be run from the shell).
+
 ### April 19, 2026 — Agent Lane 1D: Safety Module (5 Kill Switches + File-Flag IPC)
 
 **Built**: `src/tennis_edge/agent/safety.py` — owns agent run-state (`RUNNING` / `PAUSED` / `KILLED`) and evaluates every kill switch from Lane B, Lane C, Lane 1A, and Lane 1E.
