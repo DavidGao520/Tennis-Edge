@@ -690,5 +690,344 @@ def history(ctx: click.Context, export_dir: str | None) -> None:
     console.print(cat_table)
 
 
+@main.group()
+def agent() -> None:
+    """Phase 2 shadow-trade agent (Option 3).
+
+    Sub-commands:
+      start   — spawn the daemon (runs foreground; use tmux/systemd)
+      pause   — pause the running daemon (reversible)
+      resume  — clear the pause flag
+      flatten — stop the daemon and close agent-opened positions (terminal)
+      status  — print run-state, decision count, budget, daily P&L
+    """
+
+
+def _control_dir(cfg) -> Path:
+    """Resolved absolute control dir under project_root."""
+    return Path(cfg.project_root) / "data" / "agent_control"
+
+
+def _decisions_paths(cfg) -> tuple[Path, Path]:
+    root = Path(cfg.project_root)
+    return (
+        root / "data" / "agent_decisions.jsonl",
+        root / "data" / "agent_settlements.jsonl",
+    )
+
+
+@agent.command("start")
+@click.option(
+    "--mode",
+    type=click.Choice(["shadow"]),
+    default="shadow",
+    help="Phase 3A only supports shadow. 3B/3C modes come in later lanes.",
+)
+@click.option("--min-edge", type=float, default=0.08, show_default=True)
+@click.option("--cooldown", type=float, default=300.0, show_default=True,
+              help="Per-ticker cooldown seconds.")
+@click.option("--gemini-budget", type=float, default=50.0, show_default=True,
+              help="Monthly Gemini budget cap in USD.")
+@click.option("--model",
+              default="gemini-3.1-pro-preview", show_default=True,
+              help="Gemini model ID for the LLM provider.")
+@click.pass_context
+def agent_start(
+    ctx: click.Context,
+    mode: str,
+    min_edge: float,
+    cooldown: float,
+    gemini_budget: float,
+    model: str,
+) -> None:
+    """Start the agent daemon in the foreground.
+
+    Run inside tmux so SSH disconnects don't kill it:
+
+        tmux new -s agent
+        tennis-edge agent start
+        # Ctrl+B D to detach
+
+    The daemon runs three coroutines concurrently:
+      - MarketTickReader + LLM worker (AgentLoop)
+      - SettlementPoller (15 min scan)
+      - SafetyMonitor.watchdog_loop (30s scan)
+
+    Any of the five kill switches tripping exits the daemon cleanly.
+    """
+    import asyncio
+    import os
+    import signal
+
+    from .agent.decisions import DecisionLog
+    from .agent.llm import BudgetTracker, GeminiProvider, PricingRates
+    from .agent.loop import AgentLoop, AgentLoopConfig
+    from .agent.runtime import AgentRuntime, MarketCache
+    from .agent.safety import SafetyConfig, SafetyMonitor
+    from .agent.settlement import SettlementConfig, SettlementPoller
+    from .data.db import Database
+    from .exchange.auth import KalshiAuth
+    from .exchange.client import KalshiClient
+    from .features.builder import FeatureBuilder
+    from .model.predictor import LogisticPredictor
+    from .ratings.glicko2 import Glicko2Engine
+    from .ratings.tracker import RatingTracker
+
+    cfg = ctx.obj["config"]
+
+    # Gemini API key: prefer env, fall back to project .env so the CLI
+    # "just works" without the user exporting every time.
+    key = os.environ.get("TENNIS_EDGE_GEMINI_KEY")
+    if not key:
+        env_file = Path(cfg.project_root) / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if line.startswith("TENNIS_EDGE_GEMINI_KEY="):
+                    key = line.split("=", 1)[1].strip()
+                    os.environ["TENNIS_EDGE_GEMINI_KEY"] = key
+                    break
+    if not key:
+        console.print("[red]TENNIS_EDGE_GEMINI_KEY not set (.env or env var).[/red]")
+        return
+
+    async def _run() -> None:
+        db_path = Path(cfg.project_root) / cfg.database.path
+        key_path = Path(cfg.project_root) / cfg.kalshi.private_key_path
+
+        decisions_path, settlements_path = _decisions_paths(cfg)
+        decisions = DecisionLog(decisions_path, settlements_path)
+
+        # Conservative Gemini 3.x preview-tier pricing. Thinking tokens
+        # billed at output-token rate. Update when real rates confirmed.
+        rates = PricingRates(
+            input_per_1m_usd=2.50,
+            output_per_1m_usd=10.00,
+            thinking_per_1m_usd=10.00,
+        )
+        budget = BudgetTracker(
+            Path(cfg.project_root) / "data" / "agent_budget.json",
+            monthly_cap_usd={model: gemini_budget},
+        )
+        llm = GeminiProvider(
+            model=model, rates=rates, budget=budget, api_key=key,
+        )
+
+        safety = SafetyMonitor(SafetyConfig(control_dir=str(_control_dir(cfg))))
+
+        loop_cfg = AgentLoopConfig(
+            min_edge=min_edge,
+            cooldown_s=cooldown,
+            mode=mode,
+        )
+
+        with Database(db_path) as db:
+            engine = Glicko2Engine(tau=cfg.ratings.tau)
+            tracker = RatingTracker(
+                db, engine, period_days=cfg.ratings.rating_period_days,
+            )
+            builder = FeatureBuilder(db, tracker)
+            model_artifact = (
+                Path(cfg.project_root) / cfg.model.artifacts_dir / "latest.joblib"
+            )
+            predictor = LogisticPredictor.load(model_artifact)
+
+            auth = KalshiAuth(cfg.kalshi.api_key_id, str(key_path))
+            async with KalshiClient(cfg.kalshi, auth) as client:
+                runtime = AgentRuntime(
+                    db=db, tracker=tracker, builder=builder, model=predictor,
+                    market_cache=MarketCache(client),
+                )
+
+                agent_loop = AgentLoop(
+                    config=loop_cfg,
+                    db_path=db_path,
+                    safety=safety,
+                    llm=llm,
+                    decisions=decisions,
+                    model_prob_fn=runtime.model_prob_fn,
+                    context_builder=runtime.context_builder,
+                )
+                settlement = SettlementPoller(
+                    log=decisions, exchange=client,
+                    config=SettlementConfig(),
+                )
+
+                # Live-match predicate: a match is live if we have any
+                # tick with received_at within the last 5 minutes. This
+                # lets the WS_STALE watchdog fire only when we would
+                # actually expect traffic.
+                def is_live_match() -> bool:
+                    row = db.query_one(
+                        "SELECT MAX(received_at) AS m FROM market_ticks "
+                        "WHERE received_at > ?",
+                        (int(__import__("time").time()) - 300,),
+                    )
+                    return bool(row and row["m"])
+
+                # Wire SIGINT/SIGTERM to clean shutdown.
+                loop_handle = asyncio.get_running_loop()
+
+                def _graceful(_sig=None, _frame=None):
+                    agent_loop.request_stop()
+                    settlement.request_stop()
+
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    try:
+                        loop_handle.add_signal_handler(sig, _graceful)
+                    except NotImplementedError:
+                        pass  # windows
+
+                console.print(
+                    f"[bold green]Agent daemon starting[/bold green] "
+                    f"mode={mode} min_edge={min_edge} cooldown={cooldown}s "
+                    f"model={model} budget=${gemini_budget}/mo"
+                )
+                console.print(f"[dim]Control dir: {_control_dir(cfg)}[/dim]")
+                console.print(f"[dim]Decisions: {decisions_path}[/dim]")
+
+                await asyncio.gather(
+                    agent_loop.run(),
+                    settlement.run(),
+                    safety.watchdog_loop(
+                        ws=_DummyWS(),   # no WS in pure shadow; tick-DB proxy is enough
+                        db_path=db_path,
+                        budget=budget,
+                        providers=[model],
+                        risk=_NullRisk(),   # no executor in 3A, daily P&L check is a no-op
+                        live_match_fn=is_live_match,
+                        interval_s=30.0,
+                    ),
+                )
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        console.print("[yellow]Agent stopped.[/yellow]")
+
+    # If the daemon exited because of a USER_FLATTEN trip, clear the
+    # flatten flag so the next start does not immediately re-trip.
+    # (Executor is not wired in 3A so there are no positions to close.)
+    try:
+        from .agent.safety import clear_flatten_flag
+        clear_flatten_flag(_control_dir(cfg))
+    except Exception:
+        pass
+
+
+class _DummyWS:
+    """Phase 3A shadow mode: agent does not own a live WS. The tick
+    logger on the Mac mini is the sole writer; the agent only reads
+    market_ticks. Fake the timestamps so the WS watchdog never trips.
+
+    Lane C invariant: seconds_since_last_connect > 60 = link down.
+    By returning a tiny value here we opt out of that check entirely;
+    the tick-logger-stale switch is the real health signal for 3A.
+    """
+
+    def seconds_since_last_message(self):
+        return 0.0
+
+    def seconds_since_last_connect(self):
+        return 0.0
+
+
+class _NullRisk:
+    """No-op risk manager for Phase 3A (executor not wired yet).
+    daily_pnl=0 so the DAILY_LOSS_LIMIT switch never trips in shadow."""
+
+    class _State:
+        daily_pnl = 0.0
+
+    state = _State()
+
+
+@agent.command("pause")
+@click.pass_context
+def agent_pause(ctx: click.Context) -> None:
+    """Pause the running agent (reversible). Daemon stops processing
+    candidates but stays up so `resume` can flip it back."""
+    from .agent.safety import touch_pause_flag
+    p = touch_pause_flag(_control_dir(ctx.obj["config"]))
+    console.print(f"[yellow]Paused[/yellow] — flag at {p}")
+
+
+@agent.command("resume")
+@click.pass_context
+def agent_resume(ctx: click.Context) -> None:
+    """Resume a paused agent by clearing the pause flag."""
+    from .agent.safety import clear_pause_flag
+    clear_pause_flag(_control_dir(ctx.obj["config"]))
+    console.print("[green]Resumed[/green]")
+
+
+@agent.command("flatten")
+@click.pass_context
+def agent_flatten(ctx: click.Context) -> None:
+    """Stop the daemon (terminal). Trips USER_FLATTEN; the daemon
+    exits after closing agent-opened positions (3B/3C) — in 3A shadow
+    mode there are no positions, so the daemon simply exits."""
+    from .agent.safety import touch_flatten_flag
+    p = touch_flatten_flag(_control_dir(ctx.obj["config"]))
+    console.print(f"[red]Flatten signaled[/red] — flag at {p}")
+
+
+@agent.command("status")
+@click.pass_context
+def agent_status(ctx: click.Context) -> None:
+    """Print decision counts, budget, daily P&L. Safe to run while the
+    daemon is running — this command never writes."""
+    import json
+
+    from .agent.decisions import DecisionLog
+
+    cfg = ctx.obj["config"]
+    dec_path, set_path = _decisions_paths(cfg)
+    ctrl = _control_dir(cfg)
+
+    log = DecisionLog(dec_path, set_path)
+    n_decisions = log.count_decisions()
+    n_settlements = sum(1 for _ in log.iter_settlements())
+
+    table = Table(title="Agent Status")
+    table.add_column("Field", style="cyan")
+    table.add_column("Value", justify="right")
+    table.add_row("Decisions logged", str(n_decisions))
+    table.add_row("Settlements", str(n_settlements))
+    table.add_row("Unresolved", str(n_decisions - n_settlements))
+    table.add_row("Pause flag", "present" if (ctrl / "pause").exists() else "—")
+    table.add_row("Flatten flag", "present" if (ctrl / "flatten").exists() else "—")
+
+    budget_path = Path(cfg.project_root) / "data" / "agent_budget.json"
+    if budget_path.exists():
+        try:
+            blob = json.loads(budget_path.read_text())
+            for provider, s in blob.get("providers", {}).items():
+                table.add_row(
+                    f"Budget {provider}",
+                    f"${s.get('total_cost_usd', 0):.4f} "
+                    f"(calls={s.get('call_count', 0)})",
+                )
+        except Exception:
+            pass
+
+    # Counterfactual shadow P&L summary (only when settlements exist).
+    if n_settlements > 0:
+        wins = losses = voids = 0
+        pnl = 0.0
+        for s in log.iter_settlements():
+            if s.outcome == "won":
+                wins += 1
+            elif s.outcome == "lost":
+                losses += 1
+            else:
+                voids += 1
+            pnl += s.realized_pnl
+        table.add_row("Shadow wins/losses/void", f"{wins}/{losses}/{voids}")
+        pnl_color = "green" if pnl >= 0 else "red"
+        table.add_row("Counterfactual P&L", f"[{pnl_color}]${pnl:,.2f}[/]")
+
+    console.print(table)
+
+
 if __name__ == "__main__":
     main()

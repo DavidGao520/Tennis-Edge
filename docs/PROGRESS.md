@@ -255,6 +255,53 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Agent Lane H: CLI + Runtime Wiring (Phase 3A Ready to Run)
+
+**Built**: `src/tennis_edge/agent/runtime.py` (real `model_prob_fn` + `context_builder` wired to existing Glicko-2 stack) + CLI command group `tennis-edge agent`.
+
+**With this lane shipped, Phase 3A is runnable end-to-end.** `tmux new -s agent && tennis-edge agent start` on the Mac mini and shadow-trade decisions start accumulating.
+
+**`agent/runtime.py`**:
+- `AgentRuntime` bundles DB, `RatingTracker`, `FeatureBuilder`, `LogisticPredictor`, and `MarketCache`. Exposes closures that match the loop's protocols.
+- `model_prob_fn(ticker)` — sync, cache-only. Cache miss → fires an async prewarm via `loop.create_task` so the next reader poll (2s later) hits. Returns None on miss, unknown player, or model failure.
+- `context_builder(ticker, model_prob, market_yes_cents)` — sync, queries DB for last-10 form, H2H summary, rest days, surface inference.
+- `MarketCache` — 5 min TTL, in-flight coalescing via `asyncio.Task` map so concurrent `get()` calls share one REST hit.
+- `parse_market_title()` handles canonical Kalshi shape "Will X win the X vs Y: Round Of 32 match?". Tests cover unparseable and the YES-is-second-side case.
+- Surface inference: "clay"/"madrid"/"roland" → Clay, "wimbledon"/"grass" → Grass, else Hard.
+- Round inference: "final" (not "semifinal") → F, "semifinal" → SF, "quarterfinal" → QF, "16"/"32"/"64"/"128" → R16/R32/etc. Best-of defaults to 3 (Grand Slam override requires tournament metadata we don't carry today).
+
+**CLI subcommands under `tennis-edge agent`**:
+- `start [--mode shadow] [--min-edge 0.08] [--cooldown 300] [--gemini-budget 50] [--model gemini-3.1-pro-preview]` — foreground daemon. Reads `TENNIS_EDGE_GEMINI_KEY` from env or `.env`. Runs AgentLoop + SettlementPoller + SafetyMonitor watchdog concurrently via `asyncio.gather`. SIGINT/SIGTERM → graceful shutdown. On USER_FLATTEN trip, clears the flag post-exit so next start doesn't immediately re-trip.
+- `pause` — `touch data/agent_control/pause`. Reversible.
+- `resume` — remove pause flag.
+- `flatten` — `touch data/agent_control/flatten`. Terminal trip. In 3A with no executor wired, daemon simply exits.
+- `status` — reads decisions/settlements JSONL + budget JSON. Shows decision count, settlement count, unresolved, pause/flatten flags, per-provider budget, and counterfactual shadow P&L (wins/losses/void + total) when settlements exist. Never writes — safe to run concurrently with the daemon.
+
+**Foreground-in-tmux pattern** matches the tick-logger workflow already proven on the Mac mini. No daemonization, no PID files, no systemd unit. `tmux new -s agent` + `Ctrl-B D` to detach + `tmux attach -t agent` to re-attach.
+
+**Phase 3A safety simplifications** (documented in the `_DummyWS` / `_NullRisk` docstrings inside cli.py):
+- Agent does not own a live WS in shadow mode — it reads `market_ticks` via the tick-logger's DB. Both `seconds_since_last_*` helpers return `0.0` so the WS kill switches never trip; the tick-logger-stale switch is the real health signal.
+- No executor in 3A means no `RiskManager` calls, so `daily_pnl` is forced to 0 so the DAILY_LOSS_LIMIT switch stays dormant. Both switches come alive in Phase 3B when the executor lands.
+
+**Live-match predicate**: `is_live_match()` queries `SELECT MAX(received_at) FROM market_ticks WHERE received_at > now-300`. Any tick in the last 5 minutes = a match is live somewhere. That's the signal the WS_STALE watchdog would need if the agent ever opens its own WS.
+
+**Tests**: `tests/test_agent_runtime.py` — 21 cases. Covers title parsing (5), surface inference (4), round inference (6), tournament inference (2), MarketCache caches + coalesces + handles network errors + TTL expiry (4). Full model-prediction path is not re-tested here — already covered by the existing scanner path through `FeatureBuilder` and `LogisticPredictor`.
+
+**Smoke-tested CLI**:
+```
+$ tennis-edge agent pause
+Paused — flag at data/agent_control/pause
+$ tennis-edge agent status    # shows flag: present
+$ tennis-edge agent resume
+Resumed
+$ tennis-edge agent flatten
+Flatten signaled — flag at data/agent_control/flatten
+```
+
+Full suite: 179 passed (158 prior + 21 new).
+
+**Plan context**: Lane H per Phase 2 eng review — final lane of the original agent plan. With this landing, **the Phase 3A shadow-trade pipeline is production-ready**. Anthony's lanes (monitor redesign, real backtest engine) and Billy's arbitrage feasibility gate are the remaining Phase 2 work, plus Phase 3B/3C when ready.
+
 ### April 19, 2026 — Agent Lane G: Settlement Poller (Counterfactual P&L)
 
 **Built**: `src/tennis_edge/agent/settlement.py` — closes the loop on Phase 3A analytics by backfilling `agent_settlements.jsonl` with counterfactual P&L per decision.
