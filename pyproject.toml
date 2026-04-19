@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov", "pytest-asyncio", "ruff", "mypy", "respx"]
 boost = ["xgboost>=2.0", "lightgbm>=4.0"]
+agent = ["google-genai>=1.70"]  # Phase 2 agent LLM (Gemini 3.x)
 
 [project.scripts]
 tennis-edge = "tennis_edge.cli:main"

@@ -255,6 +255,38 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Agent Lane 1E: LLM Provider + Budget Tracker
+
+**Built**: `src/tennis_edge/agent/llm.py` — provider abstraction, real Gemini implementation, persistent per-month budget enforcement, structured JSON output via response_schema.
+
+- `LLMProvider` ABC with `async analyze(PromptContext) -> LLMResult`.
+- `FakeLLMProvider` for tests. Tracks `call_count`, can be injected with a canned `EvAnalysis` or configured to raise.
+- `GeminiProvider` wraps the new `google-genai` SDK (not the deprecated `google-generativeai`). Lazy import inside `__init__` so the module loads without the SDK installed.
+- `BudgetTracker` — per-provider monthly USD cap, atomic state file at `data/agent_budget.json` (tempfile + `os.replace` + `fsync`), month rollover resets counters, `reserve()` raises `BudgetExceeded` pre-flight when the projected total would cross the cap, `record()` logs the actual cost after the call completes.
+- `PricingRates(input/output/thinking per 1M usd)` — Gemini 3.x bills thinking tokens separately, so the tracker accounts for all three.
+- `PromptContext` + `build_prompt` + `PROMPT_TEMPLATE_V1` — text-only structured prompt (Phase 3A picked text-only per eng review). Includes ticker, player names, tournament, surface, pre-match model prob, Kalshi YES cents, rolling form, H2H, rest days, free-form extra_notes.
+- `GEMINI_RESPONSE_SCHEMA` — JSON schema passed via `response_schema` to force the model into the exact shape `EvAnalysis` expects. JSON parse or pydantic validation failure raises `LLMOutputError` which the 3x-consecutive kill switch in Lane 1D will count.
+
+**Error hierarchy**: `LLMError` (base) → `LLMCallError` (network, auth, server), `LLMOutputError` (parse/validate), `BudgetExceeded` (hard cap). All three inherit from `LLMError` so the safety watchdog catches one class.
+
+**Real smoke test against Gemini 3.1 Pro Preview**:
+- Sample input: Holmgren vs Broady clay R32, pre-match 53%, market 15c, form + H2H + rest days.
+- Output: `edge_estimate=0.55, recommendation=BUY_YES, confidence=high`, full reasoning + 4 key factors, all schema-valid.
+- Tokens: 224 input / 231 output / 714 thinking.
+- Cost: ~$0.01 per decision at preview-tier rates.
+- **Action**: default `max_output_tokens` raised from 2048 to 8192. Gemini 3.x reasoning budget is large enough that the first smoke with 512 got truncated mid-JSON and raised `LLMOutputError`. 8192/8192 gives 10x safety margin.
+
+**Plumbing**:
+- `pyproject.toml` — new optional extra `[agent] = google-genai>=1.70`. Install with `pip install -e '.[agent]'`.
+- `.env` — gitignored, holds `TENNIS_EDGE_GEMINI_KEY`. `.env.example` committed as a template.
+- Old `google-generativeai` SDK is deprecated per Google; only the new `google-genai` namespace is used.
+
+**Tests**: `tests/test_agent_llm.py` — 20 cases. Covers `PricingRates` math, `BudgetTracker` reserve/record/persist/rollover/corrupt-file tolerance, `FakeLLMProvider` happy + budget wiring + error paths (reserve succeeds but record skipped on call failure — no silent budget consumption), `LLMError` hierarchy, `build_prompt` substitution, and `GeminiProvider` missing-key path. Real Gemini calls are not in the unit suite — tests use the fake.
+
+Full suite: 85 passed (65 prior + 20 new).
+
+**Plan context**: Lane 1E per Phase 2 eng review. Depends on Lane 1A (`EvAnalysis` schema). Blocks 1F (loop needs a provider) and 1D (safety needs the error hierarchy to count failures).
+
 ### April 18, 2026 — Agent Lane 1A: Decision Log (JSONL Append-Only)
 
 **Built**: `src/tennis_edge/agent/` package with `decisions.py` — schemas + JSONL writer. This is the foundation; everything else in Lane 1 (`llm.py`, `safety.py`, `loop.py`) imports from here.
