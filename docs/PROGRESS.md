@@ -255,6 +255,29 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Phase 3 v2 Plan Locked (Monitor → Grounded Gemini → Auto-Execute)
+
+After reading the 22 first-run decisions, the structural problem was clear: local Glicko-2 returns a constant 0.27 for unrated Challenger players, so the `edge` gate fires on noise, and v1's context builder passes empty form/H2H data to the LLM. The LLM reasoning is technically correct given the inputs — the inputs are broken.
+
+**Direction change**: v2 flips the contract. Monitor detects a prematch EV signal → hands off to Agent → Gemini with **Google Search grounding** looks up live state itself → computes real P(YES) → Kelly sizing → Kalshi order (paper for first 20 decisions, live after).
+
+This matches the user's actual $10K/month manual workflow (Gemini + live context + Kelly-sized manual trade).
+
+**5 decisions locked via chat** (captured in detail in `docs/PHASE_3_V2_PLAN.md`):
+1. Monitor → Agent = same-process pub/sub callback
+2. Gemini Google Search grounding replaces screenshots (indefinitely)
+3. Hard stops: $50/market, $500 total, -$200 daily → kill
+4. First 20 trades paper + 30s manual confirm; auto after
+5. Week 1 whitelist: ATP/WTA Main only (Challenger Week 2+)
+
+**v1 code mostly survives**: `decisions.py`, `llm.py` (extended), `safety.py`, `settlement.py`, `risk.py`, `sizing.py`, `paper.py`, `scanner.py` all reused. The rewrites are `loop.py` (drop DB-tail, subscribe to Monitor) and `runtime.py` (drop local `model_prob_fn` for Gemini path). New files: `grounded_llm` (in `llm.py`), `monitor_bridge.py`, `executor.py`.
+
+**Estimated ~7.5 hours** of dev to reach first paper run. Test strategy: unit coverage per module with fakes, one end-to-end integration test, one real-network smoke against Gemini grounded. Target ~200 tests post-v2.
+
+**12 distinct safety layers** between "Gemini says X" and "money moves" — enumerated in the plan doc. Paper executor default on any run without explicit `--executor live`.
+
+Plan committed to `docs/PHASE_3_V2_PLAN.md`. Re-run `/plan-eng-review` on it tomorrow before coding to catch gaps.
+
 ### April 19, 2026 — Phase 3A First Real Run (Mac Mini Smoke Test)
 
 **Bootstrapped Mac mini** with Phase 1 data via `scripts/macmini_bootstrap.sh`:
