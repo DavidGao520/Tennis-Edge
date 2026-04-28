@@ -255,6 +255,30 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Phase 3 v2 Plan Eng-Reviewed + Tightened
+
+Ran `/plan-eng-review` on `docs/PHASE_3_V2_PLAN.md`. 10 issues found, 4 architectural forks resolved:
+
+1. **Dropped `Executor` ABC + `PaperExecutor` + `LiveExecutor` + `ConfirmGate` classes.** They duplicated the existing `ExchangeClient` ABC. `AgentLoop` takes an `ExchangeClient` directly; CLI flag picks paper or live. -4 classes, plan back under complexity threshold.
+2. **Killed manual-confirm gate.** 30s TUI prompt was theatrical inside detached tmux (stdin gone → every prompt auto-rejects → cohort never reaches 20 → never flips to live). Replaced with single explicit decision point: "paper for 50 trades or until counterfactual P&L positive over 10+ settled, then user manually edits config to `--executor live`."
+3. **Delete v1 prompt + ungrounded path immediately after first clean v2 paper run.** No `--llm-variant` flag, no rotting code; git history preserves v1.
+4. **First action in coding session: 5-min real grounded smoke call.** Cost/latency assumptions ($0.03-0.05/call, 15-45s) are guesses; if reality is 3x higher, budget + cooldown + min-edge defaults all need to change before writing 4hr of code.
+
+**7 critical test paths** added to plan that MUST land with the code (each one corresponds to a silent-failure mode):
+- SettlementPoller → `risk.record_settlement` → daily P&L kill switch (the v1 dormant-switch bug)
+- `client_order_id` idempotency on `place_order` retry
+- Gemini grounded edge < 0.10 → hard reject
+- Confidence == "low" → hard reject
+- Post-LLM edge re-check < 0.08 → HARD reject (v1 was soft)
+- `place_order` exception → `risk.release` called → retry safe
+- Detached-tmux startup runs without stdin
+
+**Required eval suite**: 5 historical Kalshi tennis markets, run grounded provider, assert recommendation ≥60% match outcome + `edge_estimate` within 0.20. ~$0.25/run, marked `@pytest.mark.eval`. Required before merging any prompt template change.
+
+**Coding order**: 9 steps (added smoke as Step 0; explicit `client_order_id` step; explicit SettlementPoller→risk wire step). Total ~7h dev. Lanes B/C/E parallelizable.
+
+Plan committed to `docs/PHASE_3_V2_PLAN.md`. Code starts tomorrow with the smoke call.
+
 ### April 19, 2026 — Phase 3 v2 Plan Locked (Monitor → Grounded Gemini → Auto-Execute)
 
 After reading the 22 first-run decisions, the structural problem was clear: local Glicko-2 returns a constant 0.27 for unrated Challenger players, so the `edge` gate fires on noise, and v1's context builder passes empty form/H2H data to the LLM. The LLM reasoning is technically correct given the inputs — the inputs are broken.

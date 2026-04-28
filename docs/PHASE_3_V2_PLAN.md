@@ -99,15 +99,18 @@ User's manual $10K/month workflow is already Gemini-with-live-context. v2 makes 
 
 ---
 
-## Locked decisions (from 2026-04-19 chat)
+## Locked decisions (from 2026-04-19 chat + eng review)
 
 | # | Decision | Rationale |
 |---|---|---|
 | 1 | **Monitor → Agent = same process, pub/sub callback** | Simplest; Agent owns its own scanner instance with TUI disabled. No IPC, no DB queue table. |
 | 2 | **Gemini Google Search grounding replaces screenshots** | ESPN / Flashscore / tennisabstract all live on the web. Gemini's search is more reliable than our headless Chromium would be. Screenshots deferred indefinitely. |
 | 3 | **Hard stops: $50/market, $500 total exposure, -$200 daily loss** | Matches original Phase 3C plan. RiskManager already enforces these; wire them in for real this time. |
-| 4 | **First 20 decisions = paper + manual confirm, then auto** | Paper (`PaperTradingEngine`) runs Gemini + Kelly + everything real except the actual `KalshiClient.place_order`. After 20, if results look sane, flip to live. |
+| 4 | **No manual confirm gate. Paper for 50 trades OR until counterfactual P&L positive over ≥10 settled markets (whichever later), then user manually edits config to `--executor live`** | Original plan's 30s TUI prompt theatrical in detached tmux: stdin gone, every prompt auto-rejects, cohort never reaches 20. Single explicit human decision point at the paper→live boundary instead. |
 | 5 | **Week 1 whitelist: `KXATPMATCH` + `KXWTAMATCH` only (no Challengers)** | Gemini's Google Search coverage of Challenger matches is untested. Validate the grounded pipeline on markets where ESPN/Flashscore actually have data. Challenger added Week 2. |
+| 6 | **No new Executor ABC / PaperExecutor / LiveExecutor / ConfirmGate classes** | Existing `ExchangeClient` ABC already abstracts paper vs live (both `PaperTradingEngine` and `KalshiClient` implement it). AgentLoop takes an `ExchangeClient` directly; CLI flag picks which. -4 classes vs naive plan. |
+| 7 | **Delete v1 prompt + ungrounded path immediately after first clean v2 paper run** | v1 known limited; git history preserves it. No `--llm-variant` flag, no rotting code. |
+| 8 | **First action in coding session: 5-minute real grounded smoke call** | Cost/latency assumptions ($0.03-0.05 / 15-45s) are guesses. If reality is 3x higher, budget + cooldown defaults need to change before we code 4 hours against wrong numbers. |
 
 ---
 
@@ -190,10 +193,11 @@ Any failure → `AgentDecision` logged with `reject_reason`, `executed=False`. S
 | File | Purpose |
 |---|---|
 | `agent/monitor_bridge.py` | Runs `EVScanner` in a periodic loop (same as Monitor TUI but no Rich output). Emits `MonitorSignal` objects via async callback to AgentLoop. Owns Kalshi REST polling loop. |
-| `agent/executor.py` | Unified `Executor` with two concrete impls: `PaperExecutor` (wraps `PaperTradingEngine`) and `LiveExecutor` (wraps `KalshiClient`). Shared `ConfirmGate` that prompts user via TUI + 30s timeout. Both emit `ExecutionResult`. |
 | `tests/test_agent_monitor_bridge.py` | Fake scanner + fake Kalshi, assert signals emitted correctly with whitelist + threshold. |
-| `tests/test_agent_executor.py` | Paper round-trip, confirm-timeout defaults-N, manual-confirm approves. |
 | `tests/test_agent_grounded_llm.py` | Fake Gemini grounded response, verify tool_config wiring (no real network). |
+| `tests/test_agent_gemini_eval.py` | **Required eval suite**. 5 hand-picked historical Kalshi tennis markets with known outcomes. Run grounded provider, assert recommendation matches outcome ≥60% and `edge_estimate` within 0.20 of settlement. ~$0.25/run. Run before merging any prompt template change. |
+
+**Note**: no separate `executor.py` module. `AgentLoop.__init__(exchange: ExchangeClient, ...)` takes either a `PaperTradingEngine` or `KalshiClient` directly. `cli.py agent start --executor paper|live` picks one. The `ExchangeClient` ABC in `exchange/base.py` is the only abstraction needed.
 
 ---
 
@@ -274,6 +278,34 @@ T=+3hr   SettlementPoller: Kalshi shows market resolved YES
 
 Each step: code + tests + commit + push. Same author env as always.
 
+**Step 0 (5 minutes, do FIRST)**: Real grounded smoke call. Don't write any v2 file yet.
+
+```bash
+# From the project root, in the venv
+PYTHONPATH=src python -c "
+import os
+for line in open('.env'):
+    if line.startswith('TENNIS_EDGE_GEMINI_KEY='):
+        os.environ['GEMINI_API_KEY'] = line.split('=',1)[1].strip()
+from google import genai
+from google.genai import types
+client = genai.Client()
+config = types.GenerateContentConfig(
+    tools=[types.Tool(google_search=types.GoogleSearch())],
+    response_mime_type='application/json',
+)
+prompt = '''Look up the live state of the Madrid Open 2026 ATP tournament right now.
+Pick any active match. Return JSON: {tournament, match, current_state, source_url}.'''
+resp = client.models.generate_content(
+    model='gemini-3.1-pro-preview', contents=prompt, config=config,
+)
+print('TEXT:', resp.text)
+print('USAGE:', resp.usage_metadata)
+"
+```
+
+If the per-call cost is within 2x of the $0.03-0.05 estimate, proceed to Step 1. If it's 3-5x higher, **stop** and recalibrate the budget / cooldown / min-edge before writing code.
+
 1. **GeminiGroundedProvider** (extend `agent/llm.py`)
    - New class with `tools=[types.Tool(google_search=types.GoogleSearch())]` config
    - New `PROMPT_TEMPLATE_GROUNDED_V1` template
@@ -296,25 +328,46 @@ Each step: code + tests + commit + push. Same author env as always.
    - Post-LLM edge re-check becomes HARD (reject, not soft log)
    - Est: 2h
 
-4. **Executor** (new `agent/executor.py`)
-   - `ConfirmGate` with 30s timeout, default N
-   - `PaperExecutor(paper_engine)` / `LiveExecutor(kalshi_client)` both implement common interface
-   - Mode flag from config picks one
-   - Tests: paper round-trip, confirm timeout defaults N, manual Y succeeds
-   - Est: 1.5h
-
-5. **Wire in CLI** (`cli.py`)
-   - New flags `--executor paper|live --require-confirm/--no-confirm --whitelist atp-wta-main`
-   - Replace `_DummyWS` / `_NullRisk` with real instances (RiskManager from config, WS still not owned by agent)
-   - Default: `paper + require-confirm + atp-wta-main` so starting without flags is the safe path
+4. **Executor wiring** (no new file)
+   - Add `AgentLoop.__init__(exchange: ExchangeClient, ...)` parameter.
+   - Worker calls `await self.exchange.place_order(OrderRequest(client_order_id=decision_id, ...))` after the decision gate passes.
+   - On `place_order` exception: log, call `risk.release(decision)`, append decision with `executed=False, reject_reason="order_failed"`. Do NOT trip kill switch on first failure (network flakes happen); after 3 consecutive failures, treat like LLM failures and let the existing 3x kill mechanism cover it (or add an explicit `OrderManager` failure counter — pick during impl).
+   - **No ConfirmGate.** Decision gate ends at `risk.check_and_reserve` → straight to `place_order`. Paper mode is the safety; live mode is opt-in via CLI flag.
+   - Tests: paper round-trip, place_order success path, place_order exception → release + log, idempotent retry on transient error
    - Est: 1h
 
-6. **First real paper run**
+5. **`OrderRequest.client_order_id`** (`exchange/schemas.py` + `exchange/client.py`)
+   - Add `client_order_id: str | None = None` to `OrderRequest`.
+   - Thread through `KalshiClient.place_order` to the actual Kalshi header (verify exact header name in their docs first; common pattern is `Idempotency-Key` or `client_order_id` body field).
+   - `AgentLoop` sets `client_order_id = decision.decision_id` so retries hit the same UUID.
+   - Tests: round-trip via JSON, retry-with-same-id is a no-op for Kalshi (test against `respx` mock, not real API).
+   - Est: 1h
+
+6. **Wire in CLI** (`cli.py`)
+   - New flags `--executor paper|live --whitelist atp-wta-main`
+   - Replace `_NullRisk` with real `RiskManager` from config; **keep `_DummyWS`** because Agent has no WS in v2 (or remove the WS check from `safety.watchdog_loop` entirely — pick one).
+   - Default: `paper + atp-wta-main` so starting without flags is the safe path. Live requires explicit `--executor live`.
+   - Est: 0.5h
+
+7. **SettlementPoller wires daily P&L into RiskManager**
+   - `SettlementPoller.poll_once`, after appending each `SettlementRecord`, calls `await risk.record_settlement(ticker, realized_pnl)`.
+   - Without this, `risk.state.daily_pnl` stays 0 and the `-$200/day → KILL` switch is dormant. Same hidden bug as v1.
+   - Tests: integration test driving `poll_once` against a fake exchange + verifying `risk.state.daily_pnl` reflects N losing settlements; integration test that 3 losing settlements → `daily_pnl ≤ -200` → `safety.check_daily_pnl` trips KILLED.
+   - Est: 0.5h
+
+8. **Required eval suite** (`tests/test_agent_gemini_eval.py`)
+   - 5 hand-picked historical Kalshi tennis markets with known outcomes (3 winners, 2 losers, ATP+WTA Main).
+   - For each, run `GeminiGroundedProvider.analyze` and assert `recommendation` matches outcome ≥60% of the time, `edge_estimate` within 0.20 of settlement.
+   - Costs ~$0.25/run. Mark `@pytest.mark.eval` so default `pytest tests/` skips it; explicit `pytest -m eval` runs it.
+   - Required before merging any prompt template change. If pass rate drops below baseline, revert.
+   - Est: 1h to set up + ~$0.25 per run
+
+9. **First real paper run**
    - Set `gemini-budget $10` for the smoke session
    - Let it run for 1-2 hours, pause, read all decisions, adjust thresholds, rerun
    - Est: monitoring time, not dev time
 
-Total dev: **~7.5 hours**. Fits in one focused day.
+Total dev: **~7 hours**. Fits in one focused day. The scope reduction (drop Executor classes + ConfirmGate) saves ~1.5h and a stack of tests.
 
 ---
 
@@ -386,3 +439,67 @@ At launch, with `--executor live`:
 ## Review + eng review trigger
 
 After v2 code lands (~tomorrow night), recommend re-running `/plan-eng-review` on this exact document to catch anything missed. The plan is detailed enough that the review can focus on **gaps** rather than re-deriving architecture from scratch.
+
+---
+
+## Critical test paths (from eng review, MUST be in same PR as code)
+
+These are the paths that, without explicit test coverage, will silently fail in production:
+
+| # | Path | Why it matters |
+|---|---|---|
+| 1 | `SettlementPoller → risk.record_settlement → safety.check_daily_pnl → KILLED` | Without this integration test, the $200/day kill switch is dormant. Bit v1 silently. |
+| 2 | `place_order` succeeds Kalshi-side, client times out, retry → no double position | Validates `client_order_id` idempotency. Without it, transient network blips → double exposure. |
+| 3 | Gemini grounded edge < 0.10 → reject (no order placed) | New CRITICAL hard gate vs v1's soft log. |
+| 4 | Confidence == "low" → reject regardless of edge | New CRITICAL hard gate. |
+| 5 | Post-LLM edge re-check < 0.08 → HARD reject (decision logged, no order placed) | Tightens v1's soft "log + reject_reason" to a hard block. Matters when LLM took 30s and market moved. |
+| 6 | `place_order` raises → `risk.release(decision)` called → retry safe | Without `release`, exposure ledger drifts and eventually saturates the cap. |
+| 7 | Detached-tmux startup → daemon runs without TUI input dependence | Validates no stdin reads in the hot path; covers the "no manual confirm" decision. |
+
+Plus regression tests for: cooldown enforcement, queue cap, missing API key, scanner exception in `MonitorBridge`, malformed Gemini JSON.
+
+## Failure modes and mitigations
+
+| # | Scenario | Test? | Error path? | Visible? | Critical |
+|---|---|---|---|---|---|
+| 1 | Gemini grounded returns malformed JSON | Required (#3 above) | `LLMOutputError` caught, counts toward 3x kill | Yes (log) | YES |
+| 2 | `place_order` succeeds but client times out → retry double | Required (#2 above) | `client_order_id` makes retry idempotent | Silent without test | YES |
+| 3 | SettlementPoller skips `risk.record_settlement` | Required (#1 above) | New test forces wire-up | Silent | YES |
+| 4 | Gemini grounded cost is $0.10/call, not $0.03 | Smoke before code | `BudgetTracker` logs cumulative cost; cap trips early | Visible | Medium |
+| 5 | EVScanner raises in `MonitorBridge` tick | Required (regression) | try/except in scan loop, log + continue | Visible (log) | Medium |
+| 6 | Tick-logger stops, agent keeps trading on stale prices | Already covered (Lane 1D `TICK_LOGGER_STALE` switch) | Watchdog at 60s | Visible (kill) | Low |
+
+## Worktree parallelization
+
+Independent enough to split. Module-level dependency:
+
+| Step | Modules | Depends on |
+|------|---------|------------|
+| A. `GeminiGroundedProvider` + eval suite | `agent/llm.py`, `tests/` | Step 0 smoke result |
+| B. `MonitorBridge` | `agent/monitor_bridge.py`, `scanner.py` (read), `tests/` | — |
+| C. `client_order_id` plumbing | `exchange/schemas.py`, `exchange/client.py`, `tests/` | — |
+| D. `AgentLoop` rewrite (drop DB tail, add signal subscribe + executor wire) | `agent/loop.py`, `tests/` | A, B, C |
+| E. SettlementPoller → risk wire | `agent/settlement.py`, `strategy/risk.py` (read), `tests/` | — |
+| F. CLI flags + paper/live default | `cli.py` | D |
+
+**Lanes**:
+- Lane 1: A → D → F (sequential — agent spine)
+- Lane 2: B (independent until D)
+- Lane 3: C (independent until D)
+- Lane 4: E (fully independent)
+
+Launch B + C + E in parallel, then A, then merge into D, then F. Keeps you unblocked even when A is mid-eval-suite.
+
+---
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | ISSUES_RESOLVED | 10 issues, scope reduced (-4 classes), 4 forks resolved, 7 critical test paths mandated |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — (no UI in v2) | — |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+**VERDICT**: ENG REVIEW COMPLETE — 4 forks decided (drop Executor classes, no manual-confirm gate, delete v1 post-paper, smoke first). Scope reduced from 7 new classes to 3. Critical test paths enumerated. Ready to implement starting with Step 0 smoke.
