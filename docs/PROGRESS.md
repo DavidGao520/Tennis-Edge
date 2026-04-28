@@ -255,6 +255,40 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Phase 3 v2 Step 0 + Step 1: Grounded Smoke + GeminiGroundedProvider
+
+**Step 0 grounded smoke** (5 min, before any code):
+- One real `gemini-3.1-pro-preview` call with `tools=[GoogleSearch()]` enabled
+- 18.2s latency, **$0.0153 per call**
+- Returned valid JSON; correctly cited a real ATP tour URL with Madrid Open data
+- **Cost is BELOW the $0.03-0.05 estimate**, monthly $50 cap = ~3260 calls. Comfortable.
+- Decision: proceed without retuning defaults
+
+**Step 1 GeminiGroundedProvider** (extended `agent/llm.py`):
+- New `PROMPT_TEMPLATE_GROUNDED_V1` — explicitly instructs the model to use Google Search to verify live state, with hard rule "if the match is settled or in progress, your edge_estimate should match the market price (no fade)". This is the v1 fix.
+- Refactored `GeminiProvider.analyze` to use `_get_template()` and `_build_config()` overridable hooks. No behavior change for ungrounded path.
+- New `GeminiGroundedProvider(GeminiProvider)` overrides those two hooks: returns the grounded template and a config with `tools=[GoogleSearch()]`. Drops `response_schema` (not always compatible with tool calling per Google docs); relies on prompt-level shape spec + pydantic validation, which has been proven via real smoke.
+- Provider name suffixed with `-grounded` so `BudgetTracker` keeps grounded spend in its own bucket.
+- Default `request_timeout_s` bumped from 60s to 90s (grounded calls are slower; smoke = 18s).
+
+**End-to-end real smoke through new class**: Sinner vs Norrie at 85c. Gemini searched, found the match had just finished 6-2 7-5, **correctly recommended SKIP** with high confidence and 0.85 edge_estimate (matching settled price, no edge to extract). Cost $0.0165, 18.7s.
+
+This is the structural fix for v1: agent now refuses to trade against settled outcomes because grounding tells it the truth.
+
+**Tests** (`tests/test_agent_llm.py` +8 cases):
+- `_get_template()` returns grounded template (regression check that v1 path stays on V1)
+- `_build_config()` includes `GoogleSearch` tool
+- `_build_config()` drops `response_schema` (incompatibility avoidance)
+- Provider name suffixed with `-grounded`
+- Default timeout ≥ 90s
+- Inherits API key check from base
+- Ungrounded provider config unchanged (regression)
+- Grounded prompt contains "Google Search" directive + JSON schema spec inline + settled-outcome rule
+
+Full suite: **187 passed** (179 prior + 8 new).
+
+**Next**: Lane B = `MonitorBridge` (parallelizable; runs scanner, emits signals via async callback).
+
 ### April 19, 2026 — Phase 3 v2 Plan Eng-Reviewed + Tightened
 
 Ran `/plan-eng-review` on `docs/PHASE_3_V2_PLAN.md`. 10 issues found, 4 architectural forks resolved:

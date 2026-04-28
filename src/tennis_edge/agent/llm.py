@@ -144,6 +144,47 @@ schema. edge_estimate is your probability, not the gap vs market.
 """
 
 
+PROMPT_TEMPLATE_GROUNDED_V1 = """You are a quantitative analyst for a Kalshi tennis prediction market. You have access to Google Search and you SHOULD use it to look up live information before answering.
+
+Market: {ticker}
+Outcome: YES = "{player_yes} wins", NO = "{player_no} wins"
+Context: {tournament}, {round_name}, {surface}, best-of-{best_of}
+Kalshi YES market price: {market_yes_cents}c (implied P = {market_prob:.3f})
+
+Pre-match model anchor (informational only, may be unreliable for low-coverage players): P({player_yes} wins) = {model_pre_match:.3f}
+
+Static data we have on file:
+- {player_yes}: {yes_form_last10}, {yes_rest} since last match
+- {player_no}: {no_form_last10}, {no_rest} since last match
+- Head-to-head: {h2h_summary}
+
+{extra_notes}
+
+CRITICAL: Use Google Search to verify the LIVE state of this match before answering. Specifically search for:
+1. Is this match currently in progress? If yes, what is the current set/game score?
+2. Is either player carrying an injury or fitness concern? Recent news from the last 7 days?
+3. Did either player play yesterday? Long match? Late finish?
+4. Surface-specific form for this tournament's conditions.
+
+If the match is already in progress or finished, the Kalshi market price reflects the current/final state. In that case, your edge_estimate should be near the market price (no fade against a settled outcome).
+
+If the match is pre-match, weigh live news against static features. Tennis upsets driven by off-court factors (motivation, late-night travel, equipment changes) are exactly what static models miss.
+
+If your search returns nothing useful for this match (Challenger tournaments often have thin coverage), say so in `reasoning` and lean toward SKIP / lower confidence rather than fabricating context.
+
+Output STRICT JSON matching this schema:
+{{
+  "edge_estimate": <float 0..1, your true P(YES wins)>,
+  "recommendation": "BUY_YES" | "BUY_NO" | "SKIP",
+  "confidence": "low" | "medium" | "high",
+  "reasoning": "<2-3 sentences. Cite which live facts changed your view vs the static features. If you searched and found nothing, say so.>",
+  "key_factors": ["<up to 5 short bullet strings of the most decisive points>"]
+}}
+
+edge_estimate is your true probability, NOT the gap vs market.
+"""
+
+
 def build_prompt(ctx: PromptContext, template: str = PROMPT_TEMPLATE_V1) -> str:
     """Render a PromptContext into the plain-text prompt body."""
     return template.format(
@@ -530,8 +571,27 @@ class GeminiProvider(LLMProvider):
         os.environ.setdefault("GEMINI_API_KEY", key)
         self._client = genai.Client(api_key=key)
 
+    # ---- Overridable hooks for subclasses ----
+
+    def _get_template(self) -> str:
+        """Return the prompt template string. Subclasses override to
+        swap in a different prompt (e.g. grounded variant)."""
+        return PROMPT_TEMPLATE_V1
+
+    def _build_config(self):
+        """Return the GenerateContentConfig for a request. Subclasses
+        override to add tools (e.g. Google Search grounding) or change
+        response shape constraints."""
+        return self._types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=GEMINI_RESPONSE_SCHEMA,
+            max_output_tokens=self.max_output_tokens,
+        )
+
+    # ---- Main path ----
+
     async def analyze(self, ctx: PromptContext) -> LLMResult:
-        prompt = build_prompt(ctx)
+        prompt = build_prompt(ctx, template=self._get_template())
 
         # Pre-flight token count for the input. The SDK's count_tokens
         # is synchronous; wrap in to_thread so the event loop stays free.
@@ -550,11 +610,7 @@ class GeminiProvider(LLMProvider):
         )
         await self.budget.reserve(self.name, est_cost)
 
-        config = self._types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=GEMINI_RESPONSE_SCHEMA,
-            max_output_tokens=self.max_output_tokens,
-        )
+        config = self._build_config()
 
         try:
             resp = await asyncio.wait_for(
@@ -598,4 +654,64 @@ class GeminiProvider(LLMProvider):
             thinking_tokens=thk_tok,
             cost_usd=actual_cost,
             provider=self.name,
+        )
+
+
+class GeminiGroundedProvider(GeminiProvider):
+    """Gemini provider with Google Search grounding enabled.
+
+    Phase 3A v2 default. The ungrounded GeminiProvider is kept only
+    for the existing v1 tests during the transition; per the v2 plan
+    it is deleted as soon as the first paper run lands cleanly.
+
+    Differences from GeminiProvider:
+      - Adds tools=[GoogleSearch()] to the request config so the model
+        can search the web during reasoning.
+      - Drops response_schema (Gemini's structured-output enforcement
+        is not always compatible with tool calling). The prompt
+        explicitly tells the model the JSON shape, and pydantic
+        validates the result on receipt — same defense, one fewer
+        potential incompatibility.
+      - Uses PROMPT_TEMPLATE_GROUNDED_V1 which directs the model to
+        verify live state via search before answering.
+      - Records cost under a separate "<model>-grounded" budget key
+        so a future side-by-side ungrounded vs grounded run does not
+        share a single bucket.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        rates: PricingRates,
+        budget: BudgetTracker,
+        api_key: str | None = None,
+        max_output_tokens: int = 8192,
+        max_thinking_tokens: int = 8192,
+        request_timeout_s: float = 90.0,  # grounded calls are slower; smoke = ~18s
+    ):
+        super().__init__(
+            model=model,
+            rates=rates,
+            budget=budget,
+            api_key=api_key,
+            max_output_tokens=max_output_tokens,
+            max_thinking_tokens=max_thinking_tokens,
+            request_timeout_s=request_timeout_s,
+        )
+        # Distinct budget key so grounded calls accumulate in their own
+        # bucket. BudgetTracker.monthly_cap_usd should configure this
+        # key explicitly; absent that, infinite cap applies.
+        self.name = f"{model}-grounded"
+
+    def _get_template(self) -> str:
+        return PROMPT_TEMPLATE_GROUNDED_V1
+
+    def _build_config(self):
+        # Google Search tool. Per the SDK contract, response_schema is
+        # not set — relying on prompt-level shape spec + pydantic
+        # validation (proven at smoke test).
+        return self._types.GenerateContentConfig(
+            response_mime_type="application/json",
+            tools=[self._types.Tool(google_search=self._types.GoogleSearch())],
+            max_output_tokens=self.max_output_tokens,
         )

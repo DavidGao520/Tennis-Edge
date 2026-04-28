@@ -292,6 +292,154 @@ def test_gemini_provider_requires_api_key(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# GeminiGroundedProvider — config wiring tests (no real network)
+# ---------------------------------------------------------------------------
+
+
+def test_grounded_provider_uses_grounded_template(tmp_path):
+    """Subclass must override _get_template to return the grounded
+    prompt that instructs the model to use Google Search."""
+    from tennis_edge.agent.llm import (
+        GeminiGroundedProvider,
+        PROMPT_TEMPLATE_GROUNDED_V1,
+        PROMPT_TEMPLATE_V1,
+    )
+
+    bt = BudgetTracker(tmp_path / "b.json", {})
+    p = GeminiGroundedProvider(
+        model="gemini-3.1-pro-preview",
+        rates=PricingRates(1.0, 2.0, 3.0),
+        budget=bt,
+        api_key="test-key",
+    )
+    assert p._get_template() is PROMPT_TEMPLATE_GROUNDED_V1
+    assert p._get_template() is not PROMPT_TEMPLATE_V1
+
+
+def test_grounded_provider_config_includes_google_search(tmp_path):
+    """_build_config must add the GoogleSearch tool. Without this,
+    grounding does not happen and we are back to v1 behavior."""
+    from tennis_edge.agent.llm import GeminiGroundedProvider
+
+    bt = BudgetTracker(tmp_path / "b.json", {})
+    p = GeminiGroundedProvider(
+        model="gemini-3.1-pro-preview",
+        rates=PricingRates(1.0, 2.0, 3.0),
+        budget=bt,
+        api_key="test-key",
+    )
+    config = p._build_config()
+    # Tools list present and contains a google_search Tool.
+    assert config.tools is not None
+    assert len(config.tools) == 1
+    assert config.tools[0].google_search is not None
+
+
+def test_grounded_provider_config_drops_response_schema(tmp_path):
+    """Grounded config relies on prompt-level JSON spec + pydantic
+    validation, not Gemini's response_schema. Verifying that we did
+    NOT set response_schema (incompatibility with tools)."""
+    from tennis_edge.agent.llm import GeminiGroundedProvider
+
+    bt = BudgetTracker(tmp_path / "b.json", {})
+    p = GeminiGroundedProvider(
+        model="gemini-3.1-pro-preview",
+        rates=PricingRates(1.0, 2.0, 3.0),
+        budget=bt,
+        api_key="test-key",
+    )
+    config = p._build_config()
+    # response_mime_type must still be json (so the SDK at least
+    # tries to coerce).
+    assert config.response_mime_type == "application/json"
+    # response_schema must be unset.
+    assert config.response_schema is None
+
+
+def test_grounded_provider_uses_distinct_budget_key(tmp_path):
+    """Provider name should be suffixed with '-grounded' so the
+    BudgetTracker accumulates grounded spend in a separate bucket
+    from any future ungrounded run."""
+    from tennis_edge.agent.llm import GeminiGroundedProvider
+
+    bt = BudgetTracker(tmp_path / "b.json", {})
+    p = GeminiGroundedProvider(
+        model="gemini-3.1-pro-preview",
+        rates=PricingRates(1.0, 2.0, 3.0),
+        budget=bt,
+        api_key="test-key",
+    )
+    assert p.name == "gemini-3.1-pro-preview-grounded"
+    assert p.model == "gemini-3.1-pro-preview"  # actual API model unchanged
+
+
+def test_grounded_provider_default_timeout_higher_than_ungrounded(tmp_path):
+    """Grounded calls are slower (smoke shows ~18s). Default timeout
+    bumped from 60s to 90s to absorb search-call latency."""
+    from tennis_edge.agent.llm import GeminiGroundedProvider
+
+    bt = BudgetTracker(tmp_path / "b.json", {})
+    p = GeminiGroundedProvider(
+        model="gemini-3.1-pro-preview",
+        rates=PricingRates(1.0, 2.0, 3.0),
+        budget=bt,
+        api_key="test-key",
+    )
+    assert p.request_timeout_s >= 90.0
+
+
+def test_grounded_provider_inherits_api_key_check(tmp_path, monkeypatch):
+    monkeypatch.delenv("TENNIS_EDGE_GEMINI_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    from tennis_edge.agent.llm import GeminiGroundedProvider
+
+    bt = BudgetTracker(tmp_path / "b.json", {})
+    with pytest.raises(RuntimeError, match="TENNIS_EDGE_GEMINI_KEY"):
+        GeminiGroundedProvider(
+            model="gemini-3.1-pro-preview",
+            rates=PricingRates(1.0, 2.0, 3.0),
+            budget=bt,
+            api_key=None,
+        )
+
+
+def test_ungrounded_provider_template_unchanged(tmp_path):
+    """Regression: refactoring the analyze() method to use _get_template
+    and _build_config hooks must not change GeminiProvider's behavior."""
+    from tennis_edge.agent.llm import GeminiProvider, PROMPT_TEMPLATE_V1
+
+    bt = BudgetTracker(tmp_path / "b.json", {})
+    p = GeminiProvider(
+        model="gemini-3.1-pro-preview",
+        rates=PricingRates(1.0, 2.0, 3.0),
+        budget=bt,
+        api_key="test-key",
+    )
+    assert p._get_template() is PROMPT_TEMPLATE_V1
+    config = p._build_config()
+    # Ungrounded still uses response_schema and no tools.
+    assert config.response_schema is not None
+    assert config.tools is None or config.tools == []
+
+
+def test_grounded_prompt_template_has_search_directive():
+    """The grounded prompt MUST instruct the model to use Google Search.
+    Without this directive, the tool is available but unused — same as
+    ungrounded mode."""
+    from tennis_edge.agent.llm import PROMPT_TEMPLATE_GROUNDED_V1
+
+    assert "Google Search" in PROMPT_TEMPLATE_GROUNDED_V1
+    # Must include the JSON schema instructions inline since
+    # response_schema is dropped.
+    assert "edge_estimate" in PROMPT_TEMPLATE_GROUNDED_V1
+    assert "recommendation" in PROMPT_TEMPLATE_GROUNDED_V1
+    assert "confidence" in PROMPT_TEMPLATE_GROUNDED_V1
+    # Must explicitly tell the model not to trade against settled
+    # outcomes (the v1 failure mode this lane fixes).
+    assert "settled" in PROMPT_TEMPLATE_GROUNDED_V1.lower() or "in progress" in PROMPT_TEMPLATE_GROUNDED_V1.lower()
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
