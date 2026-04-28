@@ -255,6 +255,39 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Phase 3 v2 Step 8: Gemini Eval Suite (Required Regression Gate)
+
+**Built**: `tests/test_agent_gemini_eval.py` — required gate before any future change to `PROMPT_TEMPLATE_GROUNDED_V1` lands.
+
+**5 hand-picked scenarios**, each targeting a specific failure mode:
+
+| Case | Setup | Pass criteria | Tests for |
+|---|---|---|---|
+| `settled_market_no_fade` | Sinner-Norrie at 98c (already won) | rec ∈ {SKIP, BUY_YES}; edge near 0.98 | **The v1 bug, regression** |
+| `thin_context_obscure_match` | Fictional names | rec=SKIP, conf ≤ medium | "If search returns nothing, lean SKIP" prompt rule |
+| `prematch_strong_favorite_underpriced` | Model 85%, market 60% | rec ∈ {BUY_YES, SKIP} (NOT BUY_NO) | Anchor consistency |
+| `extreme_low_price_likely_in_progress` | Model 30%, market 3c | rec ∈ {SKIP, BUY_NO}; edge near 0.03 | **The other v1 bug** |
+| `balanced_no_edge` | All static features even | rec=SKIP | Healthy "no trade" behavior |
+
+**Mechanics**:
+- All cases marked `pytest.mark.eval`
+- `pyproject.toml` registers the marker + `addopts = "-m 'not eval'"` so default `pytest tests/` skips them
+- Run explicitly with `pytest -m eval`
+- Cost ~$0.10 per full eval run, ~78 seconds wall time
+- Pass criteria are LENIENT by design — the goal is regression detection across prompt edits, not a tight benchmark
+
+**Real eval result against Gemini 3.1 Pro Preview**: **5/5 passed.** Most important:
+
+The `extreme_low_price_likely_in_progress` case (market 3c, model 30%) — exactly the situation that caused v1 to recommend BUY_YES on settled markets — Gemini v2 returns:
+- `rec=SKIP, confidence=low, edge_est=0.030` (matching market)
+- Reasoning: "The massive drop in the underdog's probability from the pre-match model (30%) to the live market price (3%) strongly implies the underdog has lost a critical game/set."
+
+This is the structural fix locked in as a test. Any future prompt change that re-introduces the v1 behavior fails this test before merging.
+
+Default suite: **222 passed, 5 deselected** (eval cases). Eval suite: **5 passed @ $0.10 total**.
+
+**Phase 3A v2 is now feature-complete.** All 8 plan steps shipped. Remaining: Step 9 = first real paper run, which is an operational step (run on Mac mini, observe, tune).
+
 ### April 19, 2026 — Phase 3 v2 Steps 4 + 6: AgentLoop Rewrite + CLI Wiring
 
 Two large pieces shipped together (the steps are tightly coupled — testing the new loop end-to-end requires the CLI to wire the bridge).
