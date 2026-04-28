@@ -718,77 +718,117 @@ def _decisions_paths(cfg) -> tuple[Path, Path]:
 
 @agent.command("start")
 @click.option(
-    "--mode",
-    type=click.Choice(["shadow"]),
-    default="shadow",
-    help="Phase 3A only supports shadow. 3B/3C modes come in later lanes.",
+    "--executor",
+    type=click.Choice(["paper", "live"]),
+    default="paper",
+    show_default=True,
+    help="paper = simulated fills (no real money). live = real Kalshi orders. "
+         "Default paper. Live requires TENNIS_EDGE_GEMINI_KEY + Kalshi auth.",
 )
-@click.option("--min-edge", type=float, default=0.08, show_default=True)
+@click.option(
+    "--whitelist",
+    type=click.Choice(["atp-wta-main", "all-tennis"]),
+    default="atp-wta-main",
+    show_default=True,
+    help="Which Kalshi tennis series the bridge scans. Week 1 = main only "
+         "(Gemini grounding works there). all-tennis adds Challengers.",
+)
+@click.option("--min-prematch-ev", type=float, default=0.15, show_default=True,
+              help="Monitor signal threshold. Below this we don't even call "
+                   "Gemini.")
 @click.option("--cooldown", type=float, default=300.0, show_default=True,
               help="Per-ticker cooldown seconds.")
 @click.option("--gemini-budget", type=float, default=50.0, show_default=True,
               help="Monthly Gemini budget cap in USD.")
 @click.option("--model",
               default="gemini-3.1-pro-preview", show_default=True,
-              help="Gemini model ID for the LLM provider.")
+              help="Gemini model ID for the grounded LLM provider.")
+@click.option("--bankroll", type=float, default=1000.0, show_default=True,
+              help="Bankroll used for Kelly sizing. Capped at "
+                   "--max-position per trade. Default $1000.")
+@click.option("--max-position", type=float, default=50.0, show_default=True,
+              help="Hard $ cap per market. Default $50.")
+@click.option("--max-total-exposure", type=float, default=500.0, show_default=True,
+              help="Hard $ cap on total open exposure. Default $500.")
+@click.option("--daily-loss-limit", type=float, default=200.0, show_default=True,
+              help="Daily P&L floor. Below this the daemon kills itself.")
+@click.option("--mode",
+              type=click.Choice(["shadow", "auto"]),
+              default="shadow", show_default=True,
+              help="Both call exchange.place_order; the difference is just "
+                   "the analytics tag on logged decisions. Use shadow during "
+                   "the paper-validation phase.")
 @click.pass_context
 def agent_start(
     ctx: click.Context,
-    mode: str,
-    min_edge: float,
+    executor: str,
+    whitelist: str,
+    min_prematch_ev: float,
     cooldown: float,
     gemini_budget: float,
     model: str,
+    bankroll: float,
+    max_position: float,
+    max_total_exposure: float,
+    daily_loss_limit: float,
+    mode: str,
 ) -> None:
-    """Start the agent daemon in the foreground.
+    """Start the v2 agent daemon in the foreground.
 
     Run inside tmux so SSH disconnects don't kill it:
 
         tmux new -s agent
-        tennis-edge agent start
+        tennis-edge agent start                # paper, ATP/WTA Main
         # Ctrl+B D to detach
 
-    The daemon runs three coroutines concurrently:
-      - MarketTickReader + LLM worker (AgentLoop)
-      - SettlementPoller (15 min scan)
-      - SafetyMonitor.watchdog_loop (30s scan)
+    The daemon runs four coroutines concurrently:
+      - MonitorBridge: scans Kalshi every 15s, emits MonitorSignal
+      - AgentLoop:     gates signal → grounded Gemini → executor
+      - SettlementPoller: 15min counterfactual P&L backfill
+      - SafetyMonitor.watchdog_loop: 30s health check + kill switches
 
-    Any of the five kill switches tripping exits the daemon cleanly.
+    The flip from paper to live is a single flag (`--executor live`).
+    Per the v2 plan: stay in paper until counterfactual P&L is positive
+    over 10+ settled markets or 50 decisions, whichever later.
     """
     import asyncio
     import os
-    import signal
+    import signal as signalmod
 
     from .agent.decisions import DecisionLog
-    from .agent.llm import BudgetTracker, GeminiProvider, PricingRates
+    from .agent.llm import BudgetTracker, GeminiGroundedProvider, PricingRates
     from .agent.loop import AgentLoop, AgentLoopConfig
+    from .agent.monitor_bridge import (
+        MonitorBridge, MonitorBridgeConfig,
+        WHITELIST_ATP_WTA_MAIN, WHITELIST_ALL_TENNIS,
+    )
     from .agent.runtime import AgentRuntime, MarketCache
     from .agent.safety import SafetyConfig, SafetyMonitor
     from .agent.settlement import SettlementConfig, SettlementPoller
+    from .config import RiskConfig
     from .data.db import Database
     from .exchange.auth import KalshiAuth
     from .exchange.client import KalshiClient
+    from .exchange.paper import PaperTradingEngine
     from .features.builder import FeatureBuilder
     from .model.predictor import LogisticPredictor
     from .ratings.glicko2 import Glicko2Engine
     from .ratings.tracker import RatingTracker
+    from .scanner import EVScanner
+    from .strategy.risk import RiskManager
+    from .strategy.sizing import PositionSizer
 
     cfg = ctx.obj["config"]
-
-    # Gemini API key: prefer env, fall back to project .env so the CLI
-    # "just works" without the user exporting every time.
-    key = os.environ.get("TENNIS_EDGE_GEMINI_KEY")
-    if not key:
-        env_file = Path(cfg.project_root) / ".env"
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                if line.startswith("TENNIS_EDGE_GEMINI_KEY="):
-                    key = line.split("=", 1)[1].strip()
-                    os.environ["TENNIS_EDGE_GEMINI_KEY"] = key
-                    break
+    key = _load_gemini_key(cfg)
     if not key:
         console.print("[red]TENNIS_EDGE_GEMINI_KEY not set (.env or env var).[/red]")
         return
+
+    series_whitelist = (
+        WHITELIST_ATP_WTA_MAIN if whitelist == "atp-wta-main"
+        else WHITELIST_ALL_TENNIS
+    )
+    grounded_provider_name = f"{model}-grounded"
 
     async def _run() -> None:
         db_path = Path(cfg.project_root) / cfg.database.path
@@ -797,8 +837,6 @@ def agent_start(
         decisions_path, settlements_path = _decisions_paths(cfg)
         decisions = DecisionLog(decisions_path, settlements_path)
 
-        # Conservative Gemini 3.x preview-tier pricing. Thinking tokens
-        # billed at output-token rate. Update when real rates confirmed.
         rates = PricingRates(
             input_per_1m_usd=2.50,
             output_per_1m_usd=10.00,
@@ -806,18 +844,41 @@ def agent_start(
         )
         budget = BudgetTracker(
             Path(cfg.project_root) / "data" / "agent_budget.json",
-            monthly_cap_usd={model: gemini_budget},
+            monthly_cap_usd={grounded_provider_name: gemini_budget},
         )
-        llm = GeminiProvider(
+        llm = GeminiGroundedProvider(
             model=model, rates=rates, budget=budget, api_key=key,
         )
 
-        safety = SafetyMonitor(SafetyConfig(control_dir=str(_control_dir(cfg))))
+        safety = SafetyMonitor(SafetyConfig(
+            control_dir=str(_control_dir(cfg)),
+            daily_loss_limit_usd=daily_loss_limit,
+        ))
+
+        risk = RiskManager(RiskConfig(
+            max_position_per_market=max_position,
+            max_total_exposure=max_total_exposure,
+            daily_loss_limit=daily_loss_limit,
+            kill_switch=False,
+        ))
 
         loop_cfg = AgentLoopConfig(
-            min_edge=min_edge,
+            queue_max=20,
             cooldown_s=cooldown,
+            max_candidate_age_s=60.0,
+            min_grounded_edge=0.10,
+            stale_edge_hard_threshold=0.08,
+            kelly_fraction=cfg.strategy.kelly_fraction,
+            bankroll=bankroll,
+            max_position_per_market=max_position,
             mode=mode,
+        )
+
+        bridge_cfg = MonitorBridgeConfig(
+            series_whitelist=series_whitelist,
+            min_prematch_ev=min_prematch_ev,
+            price_band=(10, 90),
+            poll_interval_s=15.0,
         )
 
         with Database(db_path) as db:
@@ -830,32 +891,68 @@ def agent_start(
                 Path(cfg.project_root) / cfg.model.artifacts_dir / "latest.joblib"
             )
             predictor = LogisticPredictor.load(model_artifact)
+            sizer = PositionSizer(
+                bankroll=bankroll,
+                kelly_fraction=cfg.strategy.kelly_fraction,
+                max_bet_fraction=cfg.strategy.max_bet_fraction,
+                min_edge=cfg.strategy.min_edge,
+            )
 
             auth = KalshiAuth(cfg.kalshi.api_key_id, str(key_path))
-            async with KalshiClient(cfg.kalshi, auth) as client:
+            async with KalshiClient(cfg.kalshi, auth) as kalshi_client:
                 runtime = AgentRuntime(
                     db=db, tracker=tracker, builder=builder, model=predictor,
-                    market_cache=MarketCache(client),
+                    market_cache=MarketCache(kalshi_client),
                 )
+
+                # Pick the executor. Same ExchangeClient ABC so
+                # AgentLoop is paper/live agnostic.
+                executor_client = (
+                    PaperTradingEngine(initial_balance=bankroll)
+                    if executor == "paper"
+                    else kalshi_client
+                )
+
+                # MonitorBridge needs an EVScanner to compute prematch
+                # signals. Same scanner as `tennis-edge opportunities`.
+                scanner = EVScanner(
+                    db, tracker, builder, predictor, sizer,
+                    cfg.strategy.kelly_fraction,
+                )
+
+                # prompt_builder: prefetch market via cache, then call
+                # the existing sync runtime.context_builder. Returns
+                # None if the market can't be enriched.
+                async def prompt_builder(sig):
+                    await runtime.market_cache.get(sig.ticker)
+                    return runtime.context_builder(
+                        sig.ticker, sig.model_prob, sig.market_yes_cents,
+                    )
 
                 agent_loop = AgentLoop(
                     config=loop_cfg,
-                    db_path=db_path,
                     safety=safety,
                     llm=llm,
                     decisions=decisions,
-                    model_prob_fn=runtime.model_prob_fn,
-                    context_builder=runtime.context_builder,
-                )
-                settlement = SettlementPoller(
-                    log=decisions, exchange=client,
-                    config=SettlementConfig(),
+                    risk=risk,
+                    exchange=executor_client,
+                    prompt_builder=prompt_builder,
+                    tick_db_path=db_path,
                 )
 
-                # Live-match predicate: a match is live if we have any
-                # tick with received_at within the last 5 minutes. This
-                # lets the WS_STALE watchdog fire only when we would
-                # actually expect traffic.
+                bridge = MonitorBridge(
+                    client=kalshi_client,
+                    scanner=scanner,
+                    on_signal=agent_loop.on_signal,
+                    config=bridge_cfg,
+                )
+
+                settlement = SettlementPoller(
+                    log=decisions, exchange=kalshi_client,
+                    config=SettlementConfig(),
+                    risk=risk,  # closes the v1 dormant kill switch
+                )
+
                 def is_live_match() -> bool:
                     row = db.query_one(
                         "SELECT MAX(received_at) AS m FROM market_ticks "
@@ -864,36 +961,42 @@ def agent_start(
                     )
                     return bool(row and row["m"])
 
-                # Wire SIGINT/SIGTERM to clean shutdown.
+                # SIGINT/SIGTERM → graceful shutdown across all four loops.
                 loop_handle = asyncio.get_running_loop()
 
                 def _graceful(_sig=None, _frame=None):
                     agent_loop.request_stop()
+                    bridge.request_stop()
                     settlement.request_stop()
 
-                for sig in (signal.SIGINT, signal.SIGTERM):
+                for sig in (signalmod.SIGINT, signalmod.SIGTERM):
                     try:
                         loop_handle.add_signal_handler(sig, _graceful)
                     except NotImplementedError:
                         pass  # windows
 
                 console.print(
-                    f"[bold green]Agent daemon starting[/bold green] "
-                    f"mode={mode} min_edge={min_edge} cooldown={cooldown}s "
-                    f"model={model} budget=${gemini_budget}/mo"
+                    f"[bold green]Agent v2 starting[/bold green] "
+                    f"executor={executor} whitelist={whitelist} "
+                    f"mode={mode} min_ev={min_prematch_ev} cooldown={cooldown}s"
+                )
+                console.print(
+                    f"[dim]Caps: ${max_position}/market ${max_total_exposure} total "
+                    f"daily-loss=${daily_loss_limit} budget=${gemini_budget}/mo[/dim]"
                 )
                 console.print(f"[dim]Control dir: {_control_dir(cfg)}[/dim]")
                 console.print(f"[dim]Decisions: {decisions_path}[/dim]")
 
                 await asyncio.gather(
+                    bridge.run(),
                     agent_loop.run(),
                     settlement.run(),
                     safety.watchdog_loop(
-                        ws=_DummyWS(),   # no WS in pure shadow; tick-DB proxy is enough
+                        ws=_DummyWS(),  # agent does not own a live WS
                         db_path=db_path,
                         budget=budget,
-                        providers=[model],
-                        risk=_NullRisk(),   # no executor in 3A, daily P&L check is a no-op
+                        providers=[grounded_provider_name],
+                        risk=risk,
                         live_match_fn=is_live_match,
                         interval_s=30.0,
                     ),
@@ -904,9 +1007,9 @@ def agent_start(
     except KeyboardInterrupt:
         console.print("[yellow]Agent stopped.[/yellow]")
 
-    # If the daemon exited because of a USER_FLATTEN trip, clear the
-    # flatten flag so the next start does not immediately re-trip.
-    # (Executor is not wired in 3A so there are no positions to close.)
+    # USER_FLATTEN trip: clear the flag so next start doesn't re-trip.
+    # In Phase 3A there are no agent-opened positions to close (paper
+    # has nothing real, and live mode hasn't shipped yet).
     try:
         from .agent.safety import clear_flatten_flag
         clear_flatten_flag(_control_dir(cfg))
@@ -914,31 +1017,37 @@ def agent_start(
         pass
 
 
-class _DummyWS:
-    """Phase 3A shadow mode: agent does not own a live WS. The tick
-    logger on the Mac mini is the sole writer; the agent only reads
-    market_ticks. Fake the timestamps so the WS watchdog never trips.
+def _load_gemini_key(cfg) -> str | None:
+    """Resolve TENNIS_EDGE_GEMINI_KEY from env or .env. Sets env var
+    on success so downstream SDK clients pick it up."""
+    import os
 
-    Lane C invariant: seconds_since_last_connect > 60 = link down.
-    By returning a tiny value here we opt out of that check entirely;
-    the tick-logger-stale switch is the real health signal for 3A.
-    """
+    key = os.environ.get("TENNIS_EDGE_GEMINI_KEY")
+    if key:
+        return key
+    env_file = Path(cfg.project_root) / ".env"
+    if not env_file.exists():
+        return None
+    for line in env_file.read_text().splitlines():
+        if line.startswith("TENNIS_EDGE_GEMINI_KEY="):
+            key = line.split("=", 1)[1].strip()
+            os.environ["TENNIS_EDGE_GEMINI_KEY"] = key
+            return key
+    return None
+
+
+class _DummyWS:
+    """Phase 3 v2: agent doesn't own a Kalshi WS — tick-logger does
+    that on the Mac mini. The two WS-related kill switches
+    (WS_RECONNECT_STARVATION, WS_STALE_WITH_LIVE_MATCH) are opted out
+    by reporting fresh timestamps. The TICK_LOGGER_STALE switch is
+    the real health signal for our setup."""
 
     def seconds_since_last_message(self):
         return 0.0
 
     def seconds_since_last_connect(self):
         return 0.0
-
-
-class _NullRisk:
-    """No-op risk manager for Phase 3A (executor not wired yet).
-    daily_pnl=0 so the DAILY_LOSS_LIMIT switch never trips in shadow."""
-
-    class _State:
-        daily_pnl = 0.0
-
-    state = _State()
 
 
 @agent.command("pause")

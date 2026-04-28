@@ -1,60 +1,54 @@
-"""Phase 2 Agent main loop. Shadow mode only (Phase 3A).
+"""Phase 3 v2 Agent main loop.
+
+Replaces the v1 DB-tail reader. Now subscribes to MonitorBridge signals
+via async callback, runs each candidate through grounded Gemini, and
+calls `exchange.place_order` (paper or live) after a multi-stage hard
+gate. The whole point of v2 is to fix v1's silent failure modes:
+agent now refuses to trade against settled markets and refuses to
+trade with stale edge.
 
 Pipeline
 ========
-                                                       (every ~2s)
-    tick_logger ──► market_ticks ──► MarketTickReader ─┐
-    (Mac mini)      (SQLite tail)                      │
-                                                       ▼
-                                      ┌─────────────────────────┐
-                                      │  edge = model - market  │
-                                      │  cooldown per ticker    │
-                                      │  bounded queue cap      │
-                                      └────────────┬────────────┘
-                                                   ▼
-                                           CandidateQueue
-                                                   │
-                                                   ▼
-                                      ┌─────────────────────────┐
-                                      │    LLM worker (1x)      │
-                                      │    is_running? skip     │
-                                      │    context_builder()    │
-                                      │    provider.analyze()   │
-                                      │    err: record_failure  │
-                                      │    ok:  record_success  │
-                                      │    re-check edge stale  │
-                                      │    log AgentDecision    │
-                                      └─────────────────────────┘
 
-                         watchdog_loop runs in parallel
-                         (budget / P&L / WS / tick-logger / flags)
+       MonitorBridge                                   (every 15s)
+            │
+            ▼
+    on_signal(sig)
+            │
+            ├── safety paused or killed? drop
+            ├── cooldown active? drop
+            ├── queue full? drop
+            └── enqueue Candidate
+                            │
+                            ▼
+                    LLM worker (1x)
+                            │
+                            ├── safety not running? drop
+                            ├── candidate stale (>60s queued)? drop
+                            ├── prompt_builder(sig) returns None? skip
+                            ├── Gemini grounded analyze
+                            │       LLMError? record_llm_failure, no order
+                            │       parse error? record_llm_failure, no order
+                            ├── confidence == "low"? HARD reject
+                            ├── grounded edge < min? HARD reject
+                            ├── post-LLM edge re-check < hard? HARD reject
+                            ├── Kelly size + confidence multiplier
+                            ├── risk.check_and_reserve fails? log, no order
+                            ├── exchange.place_order(client_order_id=decision_id)
+                            │       exception? release reservation, log
+                            └── append AgentDecision
 
-Phase 3A: mode="shadow" — executor is never invoked, every decision
-appended with executed=False. Phase 3B/3C will add the execute step.
+Hard rejects (vs v1 soft):
+- v1 logged "edge_stale" but still left executed=False open in shadow.
+  v2 also logs reject_reason but the executor was never going to run
+  in those branches; in live mode, the order absolutely does not go
+  to Kalshi.
 
-Key invariants
-==============
-1. Single LLM worker coroutine. At most one in-flight call at a time.
-   LLM latency (5-15s on Gemini 3.x thinking) dominates decision
-   freshness; parallelism would only make stale-edge worse.
-
-2. Per-ticker cooldown (default 5 min). Same market cannot enter the
-   queue again during cooldown window.
-
-3. Bounded queue cap (default 20). Overflow drops the new candidate
-   with a log line — never block the reader, never starve the worker.
-
-4. Candidate freshness gate at dequeue. If a candidate sat in the
-   queue longer than max_candidate_age_s, drop without LLM call.
-
-5. Post-LLM edge re-validation. Re-read latest tick after the LLM
-   returns; if |edge| collapsed below threshold, log the decision
-   with reject_reason="edge_stale" — NOT executed — but still
-   append to JSONL so shadow analytics can measure LLM latency's
-   cost in missed signals.
-
-6. Every LLM error routes through safety.record_llm_failure so the
-   3x-consecutive kill switch from Lane 1D can count.
+Mode flag (`shadow` / `auto`) controls whether the executor branch
+fires at all. In `shadow` we still call place_order on the paper
+engine -- that is what `--executor paper` is for. The semantic
+difference vs v1 is that we log a real `order_id` instead of
+hardcoding executed=False.
 """
 
 from __future__ import annotations
@@ -70,14 +64,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Protocol
 
-from .decisions import AgentDecision, DecisionLog, prompt_hash
+from ..exchange.base import ExchangeClient
+from ..exchange.schemas import OrderRequest
+from ..strategy.risk import RiskManager
+from .decisions import AgentDecision, DecisionLog, EvAnalysis, prompt_hash
 from .llm import (
     BudgetExceeded,
     LLMError,
     LLMProvider,
-    PROMPT_TEMPLATE_V1,
+    PROMPT_TEMPLATE_GROUNDED_V1,
     PromptContext,
 )
+from .monitor_bridge import MonitorSignal
 from .safety import SafetyMonitor
 
 logger = logging.getLogger(__name__)
@@ -90,30 +88,72 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class AgentLoopConfig:
-    """Tunables. Defaults chosen per Phase 2 eng review.
+    """Tunables for the v2 main loop.
 
-    min_edge               — abs(model - market) below this is dropped
-                             pre-queue. 0.08 = 8 percentage points,
-                             higher than Phase 1 scanner's 3% so we
-                             only burn LLM dollars on real signals.
-    cooldown_s             — per-ticker cooldown. 300 = 5 min.
-    queue_max              — hard cap on in-flight candidates.
-    max_candidate_age_s    — at dequeue, drop anything older.
-    tick_poll_interval_s   — how often MarketTickReader polls the DB.
-    stale_edge_threshold   — |edge| below this after LLM is "edge stale".
-                             Set to min_edge by default; operator can
-                             widen it if they want to capture near-miss
-                             signals in the log for analysis.
-    mode                   — "shadow" (Phase 3A), "human_in_loop" (3B),
-                             "auto" (3C). Only shadow wired today.
+    queue_max
+        Hard cap on in-flight candidates. Overflow drops with warning.
+
+    cooldown_s
+        Per-ticker cooldown window after a signal enters the queue.
+        Prevents the same market from spamming the queue while the
+        first candidate awaits the LLM.
+
+    max_candidate_age_s
+        At dequeue, drop anything older. Protects against burst
+        signals during a Gemini stall.
+
+    min_grounded_edge
+        Gemini's `edge_estimate` minus market price below this in
+        absolute terms means SKIP. Default 0.10 = 10pp. Below this
+        the trade is not worth real money even if confidence is high.
+
+    stale_edge_hard_threshold
+        After LLM returns, re-read the latest tick. If |edge| against
+        the most recent market price is below this, HARD reject the
+        order. Default 0.08. Tighter than min_grounded_edge to catch
+        markets that moved during Gemini's 18-30s think.
+
+    kelly_fraction
+        Fraction of full Kelly to bet (variance survival). Default
+        0.25 matches Phase 1 PositionSizer.
+
+    bankroll
+        Used as the base for Kelly sizing. Capped at
+        max_position_per_market regardless. Default $1000 keeps tests
+        deterministic; CLI sets this from KalshiClient balance.
+
+    max_position_per_market
+        Hard $ cap per ticker. Default $50 matches v2 plan.
+
+    confidence_mult_*
+        Kelly multiplier per Gemini confidence bucket. low always =
+        0.0 (no trade). medium = 0.5, high = 1.0. Plan flagged these
+        as seed values requiring recalibration after 50 settled
+        trades.
+
+    mode
+        "shadow" or "auto". Both call exchange.place_order. The
+        difference is in which exchange is wired (paper vs live)
+        and whether shadow analytics treats the result as
+        counterfactual or realized -- handled at the analytics
+        layer, not here.
     """
 
-    min_edge: float = 0.08
-    cooldown_s: float = 300.0
     queue_max: int = 20
+    cooldown_s: float = 300.0
     max_candidate_age_s: float = 60.0
-    tick_poll_interval_s: float = 2.0
-    stale_edge_threshold: float | None = None  # None → use min_edge
+
+    min_grounded_edge: float = 0.10
+    stale_edge_hard_threshold: float = 0.08
+
+    kelly_fraction: float = 0.25
+    bankroll: float = 1000.0
+    max_position_per_market: float = 50.0
+
+    confidence_mult_high: float = 1.0
+    confidence_mult_medium: float = 0.5
+    confidence_mult_low: float = 0.0
+
     mode: str = "shadow"
 
 
@@ -124,44 +164,27 @@ class AgentLoopConfig:
 
 @dataclass
 class Candidate:
-    """One queued trade opportunity."""
+    """One queued analysis attempt."""
 
     decision_id: str
-    ticker: str
-    model_prob: float
-    market_yes_cents: int
-    edge_at_decision: float
+    signal: MonitorSignal
     enqueued_at: float  # time.monotonic()
 
 
 # ---------------------------------------------------------------------------
-# Injected deps (structural typing)
+# Prompt builder protocol
 # ---------------------------------------------------------------------------
 
 
-class _ModelProbFn(Protocol):
-    """Returns the pre-match P(YES wins) for a ticker, or None if the
-    ticker is unknown (e.g. unrated player)."""
-
-    def __call__(self, ticker: str) -> float | None: ...
-
-
-class _ContextBuilder(Protocol):
-    """Builds the LLM prompt context for a ticker.
-
-    Typically queries the DB for player names, tournament, form, H2H,
-    rest days, etc. Returns None if the ticker cannot be enriched
-    (missing player data, unknown tournament) — the loop treats that
-    as a skip without counting it as an LLM failure.
-    """
-
-    def __call__(
-        self, ticker: str, model_prob: float, market_yes_cents: int
-    ) -> PromptContext | None: ...
+PromptBuilder = Callable[[MonitorSignal], Awaitable["PromptContext | None"]]
+"""Build a PromptContext from a MonitorSignal. May fetch additional
+metadata (market title, tournament, surface) over the network.
+Returns None to skip this candidate without recording an LLM failure
+(e.g., Kalshi metadata fetch failed)."""
 
 
 # ---------------------------------------------------------------------------
-# Tick reader
+# Tick re-check helper (no DB tailing — query-only)
 # ---------------------------------------------------------------------------
 
 
@@ -174,73 +197,18 @@ class _TickRow:
     last_price: int | None
 
 
-class MarketTickReader:
-    """Tails market_ticks. Returns the latest row per ticker since cursor.
+class _TickReader:
+    """Read-only point lookup against market_ticks. v2 uses this only
+    for the post-LLM edge re-check; the v1 tailing reader is gone.
 
-    Opens SQLite read-only so a stuck reader cannot block the tick
-    logger's writer. The cursor is an integer received_at; the first
-    read initializes it to "now" so we do not flood the queue with
-    every historical tick on startup.
+    Single-method API keeps the surface minimal: callers query
+    `latest_for_ticker(ticker)` and either get a row or None.
     """
 
     def __init__(self, db_path: str | os.PathLike[str]):
         self.db_path = Path(db_path)
-        self._cursor: int = int(time.time())
-
-    def latest_per_ticker(self) -> list[_TickRow]:
-        """One row per ticker, the most recent since cursor."""
-        uri = f"file:{os.fspath(self.db_path)}?mode=ro"
-        try:
-            conn = sqlite3.connect(uri, uri=True, timeout=2.0)
-        except sqlite3.OperationalError as e:
-            logger.warning("tick reader: cannot open %s: %s", self.db_path, e)
-            return []
-
-        try:
-            cur = conn.execute(
-                """
-                SELECT ticker, MAX(received_at) AS received_at,
-                       yes_bid, yes_ask, last_price
-                FROM (
-                    SELECT ticker, received_at, yes_bid, yes_ask, last_price
-                    FROM market_ticks
-                    WHERE received_at > ?
-                    ORDER BY received_at DESC
-                )
-                GROUP BY ticker
-                """,
-                (self._cursor,),
-            )
-            rows = cur.fetchall()
-        except sqlite3.OperationalError as e:
-            logger.warning("tick reader: query failed: %s", e)
-            return []
-        finally:
-            conn.close()
-
-        if not rows:
-            return []
-
-        # Advance cursor to newest received_at we saw. Any later insert
-        # this same second will be picked up next poll (acceptable —
-        # we are not running HFT).
-        max_ts = max(int(r[1]) for r in rows)
-        self._cursor = max_ts
-
-        out: list[_TickRow] = []
-        for r in rows:
-            out.append(_TickRow(
-                ticker=r[0],
-                received_at=int(r[1]),
-                yes_bid=r[2],
-                yes_ask=r[3],
-                last_price=r[4],
-            ))
-        return out
 
     def latest_for_ticker(self, ticker: str) -> _TickRow | None:
-        """Point-lookup used for post-LLM edge re-check. Does not
-        advance the cursor (that belongs to the tailing poll)."""
         uri = f"file:{os.fspath(self.db_path)}?mode=ro"
         try:
             conn = sqlite3.connect(uri, uri=True, timeout=2.0)
@@ -271,11 +239,7 @@ class MarketTickReader:
 
     @staticmethod
     def price_cents(row: _TickRow) -> int | None:
-        """Best-effort YES price in cents from a tick row.
-
-        Preference order: last_price → mid of bid/ask → ask → bid.
-        Used for edge calc only. Not a fill price.
-        """
+        """Best-effort YES price: last → mid → ask → bid → None."""
         if row.last_price is not None:
             return int(row.last_price)
         if row.yes_bid is not None and row.yes_ask is not None:
@@ -293,138 +257,104 @@ class MarketTickReader:
 
 
 class AgentLoop:
-    """Orchestrates reader, queue, LLM worker. Shadow mode only."""
+    """v2 agent. Subscribes to MonitorBridge, runs grounded Gemini,
+    sizes via Kelly, executes via injected ExchangeClient."""
 
     def __init__(
         self,
         *,
         config: AgentLoopConfig,
-        db_path: str | os.PathLike[str],
         safety: SafetyMonitor,
         llm: LLMProvider,
         decisions: DecisionLog,
-        model_prob_fn: _ModelProbFn,
-        context_builder: _ContextBuilder,
+        risk: RiskManager,
+        exchange: ExchangeClient,
+        prompt_builder: PromptBuilder,
+        tick_db_path: str | os.PathLike[str],
         run_id: str | None = None,
     ):
         self.config = config
         self.safety = safety
         self.llm = llm
         self.decisions = decisions
-        self.model_prob_fn = model_prob_fn
-        self.context_builder = context_builder
-        self.reader = MarketTickReader(db_path)
+        self.risk = risk
+        self.exchange = exchange
+        self.prompt_builder = prompt_builder
+        self.tick_reader = _TickReader(tick_db_path)
         self.queue: asyncio.Queue[Candidate] = asyncio.Queue(maxsize=config.queue_max)
         self.run_id = run_id or f"run-{uuid.uuid4().hex[:12]}"
 
         self._cooldown_until: dict[str, float] = {}
         self._stop = asyncio.Event()
+        self._consecutive_order_failures = 0
 
     # ---- public control ----
 
     def request_stop(self) -> None:
-        """Clean shutdown from outside (signal handler, CLI, tests)."""
         self._stop.set()
 
-    def _stale_threshold(self) -> float:
-        return (
-            self.config.stale_edge_threshold
-            if self.config.stale_edge_threshold is not None
-            else self.config.min_edge
+    # ---- pub/sub endpoint (called by MonitorBridge) ----
+
+    async def on_signal(self, sig: MonitorSignal) -> None:
+        """MonitorBridge entry point. Applies pre-LLM gates and queues
+        the candidate. Idempotent per ticker via cooldown."""
+        if self.safety.is_killed():
+            return
+        if self.safety.is_paused():
+            return
+
+        now = time.monotonic()
+        cooldown_end = self._cooldown_until.get(sig.ticker, 0.0)
+        if cooldown_end > now:
+            return
+
+        candidate = Candidate(
+            decision_id=f"dec-{uuid.uuid4().hex[:12]}",
+            signal=sig,
+            enqueued_at=now,
         )
+        try:
+            self.queue.put_nowait(candidate)
+        except asyncio.QueueFull:
+            logger.warning(
+                "agent: queue full (%d), dropping signal ticker=%s ev=%.3f",
+                self.config.queue_max, sig.ticker, sig.prematch_ev,
+            )
+            return
+
+        # Cooldown starts at enqueue time, not LLM return — prevents
+        # the same market from spamming the queue while the first
+        # candidate awaits Gemini.
+        self._cooldown_until[sig.ticker] = now + self.config.cooldown_s
 
     # ---- run ----
 
     async def run(self) -> None:
-        """Main entry. Runs reader + worker until safety KILLED or stop()."""
-        logger.info("agent loop starting run_id=%s mode=%s", self.run_id, self.config.mode)
-        reader_task = asyncio.create_task(self._reader_loop(), name="reader")
-        worker_task = asyncio.create_task(self._worker_loop(), name="worker")
+        """Spawn the LLM worker. Exits on stop or safety kill."""
+        logger.info(
+            "agent loop v2 starting run_id=%s mode=%s",
+            self.run_id, self.config.mode,
+        )
+        worker = asyncio.create_task(self._worker_loop(), name="agent-worker")
 
         try:
             await self._wait_until_done()
         finally:
-            reader_task.cancel()
-            worker_task.cancel()
-            for t in (reader_task, worker_task):
-                try:
-                    await t
-                except (asyncio.CancelledError, Exception):
-                    pass
-            logger.info("agent loop stopped run_id=%s", self.run_id)
+            worker.cancel()
+            try:
+                await worker
+            except (asyncio.CancelledError, Exception):
+                pass
+            logger.info("agent loop v2 stopped run_id=%s", self.run_id)
 
     async def _wait_until_done(self) -> None:
-        """Sleep until stop requested or safety kills us."""
         while not self._stop.is_set():
             if self.safety.is_killed():
-                logger.info("agent loop: safety KILLED, exiting")
                 return
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
-
-    # ---- reader ----
-
-    async def _reader_loop(self) -> None:
-        try:
-            while True:
-                if self.safety.is_killed():
-                    return
-                if not self.safety.is_paused():
-                    try:
-                        rows = self.reader.latest_per_ticker()
-                    except Exception:
-                        logger.exception("reader: unexpected failure")
-                        rows = []
-                    for row in rows:
-                        self._maybe_enqueue(row)
-                await asyncio.sleep(self.config.tick_poll_interval_s)
-        except asyncio.CancelledError:
-            return
-
-    def _maybe_enqueue(self, row: _TickRow) -> None:
-        """Decide whether this tick deserves a queue slot."""
-        now = time.monotonic()
-        cooldown_end = self._cooldown_until.get(row.ticker, 0.0)
-        if cooldown_end > now:
-            return  # cooldown active, skip silently
-
-        price = MarketTickReader.price_cents(row)
-        if price is None:
-            return
-
-        model_prob = self.model_prob_fn(row.ticker)
-        if model_prob is None:
-            return  # unknown ticker, no Glicko anchor
-
-        market_prob = price / 100.0
-        edge = model_prob - market_prob
-        if abs(edge) < self.config.min_edge:
-            return
-
-        candidate = Candidate(
-            decision_id=f"dec-{uuid.uuid4().hex[:12]}",
-            ticker=row.ticker,
-            model_prob=model_prob,
-            market_yes_cents=price,
-            edge_at_decision=edge,
-            enqueued_at=now,
-        )
-
-        try:
-            self.queue.put_nowait(candidate)
-        except asyncio.QueueFull:
-            logger.warning(
-                "queue full (%d), dropping candidate ticker=%s edge=%.3f",
-                self.config.queue_max, row.ticker, edge,
-            )
-            return
-
-        # Start the cooldown window the moment we enqueue. Prevents a
-        # burst of rapid ticks for the same market from spamming the
-        # queue while the first candidate still awaits the LLM.
-        self._cooldown_until[row.ticker] = now + self.config.cooldown_s
 
     # ---- worker ----
 
@@ -436,7 +366,8 @@ class AgentLoop:
                     await self._handle_candidate(candidate)
                 except Exception:
                     logger.exception(
-                        "worker: unexpected failure handling %s", candidate.ticker,
+                        "agent: unexpected failure handling %s",
+                        candidate.signal.ticker,
                     )
                 finally:
                     self.queue.task_done()
@@ -444,70 +375,99 @@ class AgentLoop:
             return
 
     async def _handle_candidate(self, c: Candidate) -> None:
-        # Check monitor state fresh — may have tripped since enqueue.
+        sig = c.signal
+
+        # Safety state may have flipped since enqueue.
         if not self.safety.is_running():
             logger.info(
-                "worker: safety not running (%s), dropping %s",
-                self.safety.state().value, c.ticker,
+                "agent worker: safety=%s, dropping %s",
+                self.safety.state().value, sig.ticker,
             )
             return
 
-        # Freshness gate. Candidate may have sat in the queue while the
-        # LLM worked through earlier items.
+        # Freshness gate: candidate may have queued behind a slow LLM.
         age = time.monotonic() - c.enqueued_at
         if age > self.config.max_candidate_age_s:
             logger.info(
-                "worker: dropping stale candidate ticker=%s age=%.1fs",
-                c.ticker, age,
+                "agent worker: dropping stale candidate ticker=%s age=%.1fs",
+                sig.ticker, age,
             )
             return
 
-        ctx = self.context_builder(c.ticker, c.model_prob, c.market_yes_cents)
+        ctx = await self.prompt_builder(sig)
         if ctx is None:
-            # Context builder couldn't enrich. Not an LLM failure (no
-            # call made), but worth logging. Do NOT call record_llm_*.
-            logger.info("worker: no context for %s, skipping", c.ticker)
+            # Metadata enrichment failed; not an LLM error since we
+            # never called the LLM.
+            logger.info("agent worker: no prompt context for %s, skipping",
+                        sig.ticker)
             return
 
-        # ---- LLM call ----
+        # ---- LLM ----
         try:
             result = await self.llm.analyze(ctx)
         except BudgetExceeded as e:
-            # Budget is its own kill switch in safety; we still count
-            # this as an LLM failure so the 3x counter registers.
-            logger.warning("LLM budget exceeded: %s", e)
+            logger.warning("agent worker: budget exceeded: %s", e)
             await self.safety.record_llm_failure(e)
             return
         except LLMError as e:
-            logger.warning("LLM failure (%s): %s", type(e).__name__, e)
+            logger.warning("agent worker: LLM failure (%s): %s", type(e).__name__, e)
             await self.safety.record_llm_failure(e)
             return
         except Exception as e:
-            # Defensive: anything not in the LLMError hierarchy is a
-            # bug we want to know about, but still count as failure so
-            # a persistent bug eventually trips the kill switch.
-            logger.exception("LLM unexpected error")
+            logger.exception("agent worker: unexpected LLM error")
             await self.safety.record_llm_failure(LLMError(f"unexpected: {e}"))
             return
 
         await self.safety.record_llm_success()
 
-        # ---- post-LLM edge re-check ----
-        reject_reason: str | None = None
-        edge_at_exec: float | None = None
-        latest = self.reader.latest_for_ticker(c.ticker)
-        if latest is not None:
-            latest_price = MarketTickReader.price_cents(latest)
-            if latest_price is not None:
-                edge_at_exec = c.model_prob - latest_price / 100.0
-                if abs(edge_at_exec) < self._stale_threshold():
-                    reject_reason = "edge_stale"
+        analysis = result.analysis
 
-        # ---- log decision ----
-        # Note: in Phase 3A shadow, executed is always False regardless
-        # of reject_reason. reject_reason=None just means "would have
-        # traded in 3B/3C".
-        ph = prompt_hash(PROMPT_TEMPLATE_V1, {
+        # ---- decision gates (each gate may produce a logged-but-not-executed record) ----
+
+        reject_reason = self._check_grounded_edge(analysis, sig.market_yes_cents)
+
+        edge_at_exec: float | None = None
+        if reject_reason is None:
+            edge_at_exec, stale_reject = self._post_llm_edge_check(
+                analysis, sig.ticker,
+            )
+            if stale_reject is not None:
+                reject_reason = stale_reject
+
+        # ---- size + risk reservation ----
+
+        order_request: OrderRequest | None = None
+        order_id: str | None = None
+
+        if reject_reason is None:
+            sized = self._size_kelly(
+                analysis, sig.market_yes_cents, c.decision_id,
+            )
+            if sized is None:
+                reject_reason = "kelly_zero"
+            else:
+                order_request = sized
+                # Risk manager check_and_reserve is the last hard gate
+                # before committing any capital.
+                ok, reason = await self.risk.check_and_reserve(
+                    self._risk_decision_for(order_request, sig),
+                )
+                if not ok:
+                    reject_reason = f"risk: {reason}"
+                    order_request = None
+
+        # ---- execute ----
+
+        if order_request is not None:
+            order_id = await self._place_order_safely(
+                order_request, sig, analysis, c.decision_id,
+            )
+            if order_id is None:
+                reject_reason = "order_failed"
+
+        # ---- log ----
+
+        ph = prompt_hash(PROMPT_TEMPLATE_GROUNDED_V1, {
             "ticker": ctx.ticker,
             "player_yes": ctx.player_yes,
             "player_no": ctx.player_no,
@@ -519,41 +479,221 @@ class AgentLoop:
             ts=datetime.now(timezone.utc),
             run_id=self.run_id,
             decision_id=c.decision_id,
-            ticker=c.ticker,
-            model_pre_match=c.model_prob,
-            market_yes_cents=c.market_yes_cents,
-            edge_at_decision=c.edge_at_decision,
+            ticker=sig.ticker,
+            model_pre_match=sig.model_prob,
+            market_yes_cents=sig.market_yes_cents,
+            edge_at_decision=sig.model_prob - sig.market_prob,
             llm_provider=result.provider,
             llm_prompt_hash=ph,
             llm_raw_output=result.raw_output,
-            analysis=result.analysis,
-            screenshot_paths=[],  # 3A: no screenshots
+            analysis=analysis,
+            screenshot_paths=[],
             mode=self.config.mode,  # type: ignore[arg-type]
-            executed=False,        # 3A always logs-only
-            order_id=None,
+            executed=(order_id is not None),
+            order_id=order_id,
             edge_at_execution=edge_at_exec,
             reject_reason=reject_reason,
         )
         self.decisions.append_decision(decision)
         logger.info(
-            "decision logged: %s edge=%.3f → %.3f rec=%s%s",
-            c.ticker, c.edge_at_decision,
-            edge_at_exec if edge_at_exec is not None else float("nan"),
-            result.analysis.recommendation,
-            f" REJECT:{reject_reason}" if reject_reason else "",
+            "decision: %s rec=%s conf=%s ev_est=%.3f edge_exec=%s exec=%s%s",
+            sig.ticker, analysis.recommendation, analysis.confidence,
+            analysis.edge_estimate,
+            f"{edge_at_exec:.3f}" if edge_at_exec is not None else "n/a",
+            order_id or "no",
+            f" reject={reject_reason}" if reject_reason else "",
         )
 
-    # ---- helpers for tests ----
+    # ---- decision-gate helpers ----
 
-    async def tick_once(self) -> None:
-        """One-shot reader poll. Used by tests to drive deterministically."""
-        rows = self.reader.latest_per_ticker()
-        for row in rows:
-            self._maybe_enqueue(row)
+    def _check_grounded_edge(
+        self, analysis: EvAnalysis, market_yes_cents: int,
+    ) -> str | None:
+        """Hard reject if Gemini's claimed edge or confidence is too low."""
+        if analysis.confidence == "low":
+            return "confidence_low"
+
+        market_prob = market_yes_cents / 100.0
+
+        # For SKIP, edge is 0 by definition.
+        if analysis.recommendation == "SKIP":
+            return "rec_skip"
+
+        if analysis.recommendation == "BUY_YES":
+            grounded_edge = analysis.edge_estimate - market_prob
+        else:  # BUY_NO
+            grounded_edge = (1.0 - analysis.edge_estimate) - (1.0 - market_prob)
+
+        if grounded_edge < self.config.min_grounded_edge:
+            return "grounded_edge_below_min"
+        return None
+
+    def _post_llm_edge_check(
+        self, analysis: EvAnalysis, ticker: str,
+    ) -> tuple[float | None, str | None]:
+        """Re-read latest tick. Hard reject if edge collapsed.
+
+        Returns (edge_at_execution, reject_reason). edge_at_execution
+        may be non-None even when we reject — useful for shadow analytics.
+        """
+        latest = self.tick_reader.latest_for_ticker(ticker)
+        if latest is None:
+            # No fresh tick. Be conservative — reject rather than fill
+            # at a possibly stale price. tick-logger gap is also a
+            # safety concern that the watchdog handles separately.
+            return None, "no_recent_tick"
+
+        latest_price = self.tick_reader.price_cents(latest)
+        if latest_price is None:
+            return None, "no_recent_price"
+
+        market_prob = latest_price / 100.0
+        if analysis.recommendation == "BUY_YES":
+            edge_live = analysis.edge_estimate - market_prob
+        else:  # BUY_NO
+            edge_live = (1.0 - analysis.edge_estimate) - (1.0 - market_prob)
+
+        if abs(edge_live) < self.config.stale_edge_hard_threshold:
+            return edge_live, "edge_stale"
+
+        return edge_live, None
+
+    def _size_kelly(
+        self, analysis: EvAnalysis, market_yes_cents: int, decision_id: str,
+    ) -> OrderRequest | None:
+        """Kelly + confidence multiplier + per-market cap. None to skip."""
+        if analysis.recommendation == "BUY_YES":
+            side = "yes"
+            cost_per_cents = market_yes_cents
+            true_p = analysis.edge_estimate
+        elif analysis.recommendation == "BUY_NO":
+            side = "no"
+            cost_per_cents = 100 - market_yes_cents
+            true_p = 1.0 - analysis.edge_estimate
+        else:
+            return None  # SKIP
+
+        if cost_per_cents <= 0 or cost_per_cents >= 100:
+            return None
+        cost_prob = cost_per_cents / 100.0
+
+        # Fractional Kelly: f = (p - cost_prob) / (1 - cost_prob)
+        raw_kelly = (true_p - cost_prob) / (1.0 - cost_prob)
+        if raw_kelly <= 0:
+            return None
+
+        conf_mult = {
+            "high": self.config.confidence_mult_high,
+            "medium": self.config.confidence_mult_medium,
+            "low": self.config.confidence_mult_low,
+        }[analysis.confidence]
+        if conf_mult <= 0:
+            return None
+
+        fraction = raw_kelly * self.config.kelly_fraction * conf_mult
+        bet_amount = min(
+            fraction * self.config.bankroll,
+            self.config.max_position_per_market,
+        )
+
+        num_contracts = max(1, int(bet_amount * 100 / cost_per_cents))
+        # Recompute actual bet from integer contracts so risk reservation
+        # matches the wire amount.
+        actual_bet_dollars = num_contracts * cost_per_cents / 100.0
+        if actual_bet_dollars <= 0:
+            return None
+
+        # Phase 3A: limit orders at the observed market price.
+        # client_order_id is the decision_id — same UUID survives any
+        # network-timeout retry so Kalshi treats it as the same order.
+        return OrderRequest(
+            ticker=analysis.recommendation,  # placeholder, overwritten below
+            action="buy",
+            side=side,  # type: ignore[arg-type]
+            type="limit",
+            count=num_contracts,
+            yes_price=market_yes_cents,  # YES limit price in cents
+            client_order_id=decision_id,
+        )
+
+    def _risk_decision_for(self, order: OrderRequest, sig: MonitorSignal):
+        """Adapt OrderRequest to the BetDecision shape RiskManager needs.
+
+        Uses `sig.ticker` rather than `order.ticker` because the
+        OrderRequest carries a placeholder ticker until
+        `_place_order_safely` rewrites it. Risk tracking must use the
+        authoritative market identifier from the signal, not the
+        placeholder, or exposure attribution drifts to the wrong key.
+        """
+        from ..strategy.sizing import BetDecision
+
+        cost_per_cents = (
+            sig.market_yes_cents if order.side == "yes"
+            else 100 - sig.market_yes_cents
+        )
+        bet_amount = (order.count or 0) * cost_per_cents / 100.0
+        return BetDecision(
+            ticker=sig.ticker,
+            side=order.side,
+            model_prob=sig.model_prob,
+            market_prob=sig.market_prob,
+            edge=sig.model_prob - sig.market_prob,
+            kelly_frac=0.0,  # not used in the check
+            bet_amount=bet_amount,
+            num_contracts=order.count or 0,
+        )
+
+    # ---- executor ----
+
+    async def _place_order_safely(
+        self,
+        order: OrderRequest,
+        sig: MonitorSignal,
+        analysis: EvAnalysis,
+        decision_id: str,
+    ) -> str | None:
+        """Wrap exchange.place_order. On failure, release the risk
+        reservation and bump the consecutive-failure counter.
+
+        Returns the order_id on success, None on failure.
+        """
+        # The OrderRequest from _size_kelly carries the recommendation
+        # in `ticker` as a placeholder; fix it here so the executor
+        # actually targets the market.
+        order = order.model_copy(update={"ticker": sig.ticker})
+
+        try:
+            resp = await self.exchange.place_order(order)
+        except Exception:
+            logger.exception(
+                "agent worker: place_order failed ticker=%s side=%s",
+                sig.ticker, order.side,
+            )
+            await self.risk.release(self._risk_decision_for(order, sig))
+            self._consecutive_order_failures += 1
+            if self._consecutive_order_failures >= 3:
+                # Persistent execution failures are a separate failure
+                # mode from LLM problems. Use the dedicated
+                # ORDER_CONSECUTIVE_FAILURES TripReason so post-mortem
+                # analytics can distinguish "the LLM was flaky" from
+                # "Kalshi was rejecting our orders".
+                from .safety import TripReason as _TripReason
+                await self.safety.kill(
+                    _TripReason.ORDER_CONSECUTIVE_FAILURES,
+                    f"3 consecutive place_order failures (last ticker={sig.ticker})",
+                )
+            return None
+
+        self._consecutive_order_failures = 0
+        return resp.order_id or None
+
+    # ---- testing helpers ----
 
     async def drain_once(self) -> bool:
-        """Handle exactly one candidate if present; return True if one
-        was processed. Non-blocking."""
+        """Process exactly one queued candidate (non-blocking).
+
+        Used by tests to drive the loop deterministically.
+        """
         try:
             c = self.queue.get_nowait()
         except asyncio.QueueEmpty:
@@ -565,6 +705,5 @@ class AgentLoop:
         return True
 
     def cooldown_remaining(self, ticker: str) -> float:
-        """For tests: seconds left on a ticker cooldown, 0 if none."""
         end = self._cooldown_until.get(ticker, 0.0)
         return max(0.0, end - time.monotonic())

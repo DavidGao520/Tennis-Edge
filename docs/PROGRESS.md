@@ -255,6 +255,56 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Phase 3 v2 Steps 4 + 6: AgentLoop Rewrite + CLI Wiring
+
+Two large pieces shipped together (the steps are tightly coupled — testing the new loop end-to-end requires the CLI to wire the bridge).
+
+**Step 4: AgentLoop rewrite (`src/tennis_edge/agent/loop.py`)**
+
+v1's DB-tail reader is gone. v2 is a pure subscriber:
+- `on_signal(MonitorSignal)` is the public pub/sub endpoint MonitorBridge calls
+- Pre-LLM gates: safety running + cooldown + queue cap (same as v1)
+- Worker: prompt_builder (returns None = silent skip, NOT an LLM failure) → grounded Gemini → multi-stage hard gate
+- Hard gates: `confidence_low` / `grounded_edge_below_min` / `rec_skip` / `edge_stale` (post-LLM re-check is now a HARD reject, not v1's soft log) / `no_recent_tick` (refuse to fill at unknown price) / `kelly_zero` / `risk:*`
+- On gate pass: Kelly-size with confidence multiplier (1.0 high / 0.5 medium / 0.0 low), `risk.check_and_reserve`, then `exchange.place_order(OrderRequest(client_order_id=decision_id, ...))`
+- On `place_order` exception: `risk.release()` to unwind, log decision with `reject_reason="order_failed"`. **3 consecutive order failures → `safety.kill(ORDER_CONSECUTIVE_FAILURES)`** (new dedicated TripReason, distinct from LLM failures so post-mortem analytics can tell them apart).
+
+`AgentLoop` constructor now takes a `prompt_builder` async callable + an `exchange: ExchangeClient`. The `ExchangeClient` ABC abstracts paper vs live cleanly — no `Executor` class needed (the eng-review scope reduction in action). The CLI picks `PaperTradingEngine` or `KalshiClient` and passes it in.
+
+`SafetyMonitor` got a public `kill(reason, detail)` method so callers (Phase 3 v2: AgentLoop's order-failure path) can flip state to KILLED with a specific TripReason without piggybacking on the LLM rail. New `TripReason.ORDER_CONSECUTIVE_FAILURES` enum value.
+
+**Test rewrite** (`tests/test_agent_loop.py`, 26 cases — replaces v1's 24):
+- `_TickReader`: latest_for_ticker, none on missing, price_cents preference
+- `on_signal`: enqueues running, drops paused/killed, cooldown blocks, queue cap drops overflow
+- Worker happy path: places paper order, logs `executed=True` + real `order_id`
+- Hard rejects: confidence_low, grounded_edge_below_min, rec_skip, edge_stale (with stale tick), no_recent_tick
+- Risk gate: tight per-market cap rejects second trade with `reject_reason` starting "risk:"
+- Executor failures: `place_order` raises → `risk.release` → no double-charge → 3 in a row → `ORDER_CONSECUTIVE_FAILURES` kill
+- LLM failures: counted via `safety.record_llm_failure`, 3 trip kill, success resets counter
+- Freshness gate, paused-mid-handle skip, prompt_builder=None silent skip
+- Decision log shape: run_id, prompt_hash, raw_output, edge_at_execution all populated
+
+**Step 6: CLI wiring (`src/tennis_edge/cli.py agent start`)**
+
+Rewrote `agent_start` to wire the v2 stack:
+- New flags: `--executor paper|live`, `--whitelist atp-wta-main|all-tennis`, `--min-prematch-ev` (was `--min-edge`), `--bankroll`, `--max-position`, `--max-total-exposure`, `--daily-loss-limit`, `--mode shadow|auto`
+- Defaults are the safe path: `paper + atp-wta-main + shadow` so a bare `tennis-edge agent start` cannot place real orders.
+- Spawns four coroutines via `asyncio.gather`:
+  1. `MonitorBridge.run` — scans Kalshi, emits signals to `agent_loop.on_signal`
+  2. `AgentLoop.run` — drains signal queue, runs grounded Gemini, places orders
+  3. `SettlementPoller.run` — 15min counterfactual P&L backfill, **wired with `risk=risk` so settlements update `daily_pnl`**
+  4. `SafetyMonitor.watchdog_loop` — 30s health check, real `RiskManager` (no more `_NullRisk` placeholder)
+- `_DummyWS` retained — agent doesn't own a Kalshi WS in v2 either (tick-logger has it). The two WS kill switches stay opted-out by reporting fresh timestamps; `TICK_LOGGER_STALE` is the actual health signal.
+
+CLI smoke-tested:
+- `tennis-edge agent --help` lists subcommands
+- `tennis-edge agent start --help` shows all 11 flags with defaults
+- `tennis-edge agent status` displays correctly with empty JSONL
+
+Full suite: **222 passed** (220 prior + 26 new agent_loop − 24 old = +2 net).
+
+**Next**: Step 8 = required eval suite (5 historical Kalshi markets, `pytest -m eval`). Then Step 9 = first real paper run.
+
 ### April 19, 2026 — Phase 3 v2 Steps 3 + 7: Idempotency + RiskManager Wire
 
 Two short, independent lanes shipped together:

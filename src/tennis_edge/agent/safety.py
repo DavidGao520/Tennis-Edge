@@ -98,6 +98,7 @@ class TripReason(Enum):
     BUDGET_EXCEEDED = "budget_exceeded"
     DAILY_LOSS_LIMIT = "daily_loss_limit"
     USER_FLATTEN = "user_flatten"
+    ORDER_CONSECUTIVE_FAILURES = "order_consecutive_failures"
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,16 @@ class SafetyMonitor:
 
     def consecutive_llm_failures(self) -> int:
         return self._llm_failures
+
+    async def kill(self, reason: TripReason, detail: str) -> None:
+        """Public hook for callers (e.g. AgentLoop's order-failure path)
+        that need to flip state to KILLED with a specific TripReason
+        without going through the LLM-failure rail.
+
+        Idempotent: first trip wins. KILLED is terminal regardless of
+        which switch fired.
+        """
+        await self._trip_once(reason, detail)
 
     # ---- user-initiated control ----
 
