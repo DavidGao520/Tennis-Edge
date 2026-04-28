@@ -356,6 +356,135 @@ async def test_poll_once_stop_short_circuits(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_poll_once_calls_risk_record_settlement(tmp_path):
+    """The v2 fix: SettlementPoller writes pnl to RiskManager so the
+    DAILY_LOSS_LIMIT kill switch in SafetyMonitor has a value to
+    check. Without this wire, daily_pnl stays 0 forever (v1 silent
+    bug)."""
+    from tennis_edge.config import RiskConfig
+    from tennis_edge.strategy.risk import RiskManager
+
+    log = DecisionLog(tmp_path / "d.jsonl", tmp_path / "s.jsonl")
+    log.append_decision(_decision(decision_id="d-1", ticker="T1",
+                                  recommendation="BUY_YES",
+                                  market_yes_cents=15))
+
+    ex = FakeExchange(markets={
+        "T1": FakeMarket(ticker="T1", status="settled", result="no"),
+    })
+    risk = RiskManager(RiskConfig())
+    poller = SettlementPoller(
+        log, ex, SettlementConfig(per_market_delay_s=0.0),
+        risk=risk,
+    )
+
+    await poller.poll_once()
+
+    # BUY_YES at 15c, NO won → -$50 counterfactual (full stake lost).
+    assert risk.state.daily_pnl == pytest.approx(-50.0)
+
+
+@pytest.mark.asyncio
+async def test_poll_once_works_without_risk_param(tmp_path):
+    """Backwards compatibility: SettlementPoller can run without a
+    RiskManager (e.g. in pure analytics replay)."""
+    log = DecisionLog(tmp_path / "d.jsonl", tmp_path / "s.jsonl")
+    log.append_decision(_decision(decision_id="d-1", ticker="T1"))
+    ex = FakeExchange(markets={
+        "T1": FakeMarket(ticker="T1", status="settled", result="yes"),
+    })
+    poller = SettlementPoller(
+        log, ex, SettlementConfig(per_market_delay_s=0.0),
+    )
+    written = await poller.poll_once()
+    assert written == 1
+
+
+@pytest.mark.asyncio
+async def test_three_losing_settlements_trip_daily_loss_kill_switch(tmp_path):
+    """END-TO-END regression test for the v1 dormant kill switch.
+
+    Walks the full chain: SettlementPoller writes settlements →
+    RiskManager.daily_pnl drops below limit → SafetyMonitor's
+    check_daily_pnl trips KILLED.
+
+    Without the v2 SettlementPoller→risk wire, this test fails
+    because daily_pnl never moves."""
+    from tennis_edge.agent.safety import SafetyConfig, SafetyMonitor, TripReason
+    from tennis_edge.config import RiskConfig
+    from tennis_edge.strategy.risk import RiskManager
+
+    log = DecisionLog(tmp_path / "d.jsonl", tmp_path / "s.jsonl")
+    # Three BUY_YES decisions on different tickers, all at 15c.
+    # Each loss = -$50 counterfactual = -$150 total, well past the
+    # default $200 limit threshold... actually default is $100, so
+    # set it explicit to make the test readable.
+    for i in range(3):
+        log.append_decision(_decision(
+            decision_id=f"d-{i}", ticker=f"T{i}",
+            recommendation="BUY_YES", market_yes_cents=15,
+        ))
+
+    ex = FakeExchange(markets={
+        f"T{i}": FakeMarket(ticker=f"T{i}", status="settled", result="no")
+        for i in range(3)
+    })
+    risk = RiskManager(RiskConfig(daily_loss_limit=100.0))
+    safety = SafetyMonitor(SafetyConfig(
+        daily_loss_limit_usd=100.0,
+        control_dir=str(tmp_path / "ctrl"),
+    ))
+    poller = SettlementPoller(
+        log, ex,
+        SettlementConfig(
+            counterfactual_notional_usd=50.0, per_market_delay_s=0.0,
+        ),
+        risk=risk,
+    )
+
+    # Before settlements: daily_pnl is 0, kill switch dormant.
+    await safety.check_daily_pnl(risk)
+    assert safety.is_running()
+
+    # Process settlements: 3x -$50 = -$150, past the $100 limit.
+    await poller.poll_once()
+    assert risk.state.daily_pnl == pytest.approx(-150.0)
+
+    # Now the kill switch should trip.
+    await safety.check_daily_pnl(risk)
+    assert safety.is_killed()
+    assert safety.trip_event().reason is TripReason.DAILY_LOSS_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_poll_once_continues_when_risk_record_settlement_raises(tmp_path, caplog):
+    """A buggy RiskManager must not halt settlement persistence —
+    the JSONL record is the source of truth, daily_pnl is derived."""
+    log = DecisionLog(tmp_path / "d.jsonl", tmp_path / "s.jsonl")
+    log.append_decision(_decision(decision_id="d-1", ticker="T1"))
+    ex = FakeExchange(markets={
+        "T1": FakeMarket(ticker="T1", status="settled", result="yes"),
+    })
+
+    class BadRisk:
+        async def record_settlement(self, ticker, pnl):
+            raise RuntimeError("simulated risk bug")
+
+    poller = SettlementPoller(
+        log, ex, SettlementConfig(per_market_delay_s=0.0),
+        risk=BadRisk(),
+    )
+
+    with caplog.at_level("ERROR"):
+        written = await poller.poll_once()
+
+    assert written == 1
+    assert any("risk.record_settlement failed" in r.message for r in caplog.records)
+    # Settlement still appended despite the risk-side crash.
+    assert len(list(log.iter_settlements())) == 1
+
+
+@pytest.mark.asyncio
 async def test_run_loop_exits_on_stop(tmp_path):
     log = DecisionLog(tmp_path / "d.jsonl", tmp_path / "s.jsonl")
     ex = FakeExchange()

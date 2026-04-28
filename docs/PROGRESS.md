@@ -255,6 +255,39 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Phase 3 v2 Steps 3 + 7: Idempotency + RiskManager Wire
+
+Two short, independent lanes shipped together:
+
+**Step 3: `OrderRequest.client_order_id` plumbing**
+- Added `client_order_id: str | None = None` to `OrderRequest`
+- `KalshiClient.place_order` already calls `model_dump(exclude_none=True)` so the field auto-flows to the wire when set
+- Phase 3A `AgentLoop` will set `client_order_id = decision.decision_id` (UUID4) so a network-timeout retry hitting Kalshi twice is treated as the same order — single fill, not double position
+- Paper engine accepts the field but ignores it (no network = no idempotency need)
+
+Tests (`tests/test_exchange_idempotency.py`, 8 cases):
+- Schema default is None; accepts a string; round-trips JSON
+- `model_dump(exclude_none=True)` includes when set, excludes when None
+- KalshiClient sends in body when set (verified with respx mock)
+- KalshiClient omits from body when None (avoids null-validation issue)
+- Paper engine accepts without crashing
+
+**Step 7: SettlementPoller → RiskManager wire (closes the v1 dormant kill switch)**
+- `SettlementPoller(..., risk: RiskManager | None = None)` — optional injection
+- After every settlement append, calls `await self.risk.record_settlement(ticker, pnl)` if `risk` is wired
+- Without this, `RiskManager.state.daily_pnl` stayed at 0 forever and the SafetyMonitor's `DAILY_LOSS_LIMIT` kill switch was dormant — the same bug as v1
+- A buggy `record_settlement` is logged but does NOT halt the poller (settlement record is the source of truth, daily_pnl is derived)
+
+Tests (`tests/test_agent_settlement.py`, +4 cases, 25 total):
+- `record_settlement` called with correct pnl
+- Backwards compatible: works without `risk` param (analytics replay)
+- **End-to-end regression**: 3 losing settlements at -$50 each (counterfactual) → `daily_pnl = -$150` → `SafetyMonitor.check_daily_pnl` trips `DAILY_LOSS_LIMIT`. Without the v2 wire, this test fails because daily_pnl never moves. This is the v1 bug, captured.
+- A crashing risk manager doesn't take down the poller; settlement still appends
+
+Full suite: **220 passed** (208 prior + 8 idempotency + 4 settlement regression).
+
+**Next**: Step 4 = `AgentLoop` rewrite. Depends on Steps 1+2 (both shipped). Drops DB-tail reader, adds `on_signal` endpoint subscribed to MonitorBridge, calls `exchange.place_order(OrderRequest(client_order_id=decision.decision_id, ...))` after the decision gate. ~2h.
+
 ### April 19, 2026 — Phase 3 v2 Step 2: MonitorBridge
 
 **Built**: `src/tennis_edge/agent/monitor_bridge.py` — embedded scanner-runner that pushes filtered signals to `AgentLoop` via async callback. v2 replacement for v1's DB-tail reader.

@@ -71,6 +71,13 @@ from .decisions import AgentDecision, DecisionLog, SettlementRecord
 logger = logging.getLogger(__name__)
 
 
+# Optional risk manager protocol — see SettlementPoller docstring for why
+# this is optional and how the wiring closes the v1 dormant-kill-switch
+# bug.
+class _RiskProto:
+    async def record_settlement(self, ticker: str, pnl: float) -> None: ...  # pragma: no cover
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -186,17 +193,29 @@ class _MarketFetcher:
 
 
 class SettlementPoller:
-    """Backfills outcomes for Phase 3A shadow decisions."""
+    """Backfills outcomes for Phase 3A shadow decisions.
+
+    The optional `risk` parameter wires settlements into the
+    `RiskManager.daily_pnl` counter. Without it, the v1 silent bug
+    repeats: SafetyMonitor's `DAILY_LOSS_LIMIT` kill switch checks
+    `risk.state.daily_pnl`, but no one ever calls
+    `risk.record_settlement(...)`, so the value stays at 0 and the
+    switch is dormant. Pass the same `RiskManager` instance the agent
+    daemon uses, and every settlement (including counterfactual P&L
+    in shadow mode) updates the daily P&L floor.
+    """
 
     def __init__(
         self,
         log: DecisionLog,
         exchange: _MarketFetcher,
         config: SettlementConfig,
+        risk: _RiskProto | None = None,
     ):
         self.log = log
         self.exchange = exchange
         self.config = config
+        self.risk = risk
         self._stop = asyncio.Event()
 
     def request_stop(self) -> None:
@@ -263,6 +282,23 @@ class SettlementPoller:
                     d.ticker, d.decision_id[:12], d.analysis.recommendation,
                     outcome, pnl,
                 )
+
+                # Wire the realized P&L into the RiskManager so the
+                # SafetyMonitor's DAILY_LOSS_LIMIT switch actually has
+                # a value to check. The v1 silent bug was that this
+                # call did not exist, so daily_pnl stayed at 0
+                # forever and the kill switch was dormant.
+                if self.risk is not None:
+                    try:
+                        await self.risk.record_settlement(d.ticker, pnl)
+                    except Exception:
+                        # Don't let a buggy risk manager halt the
+                        # poller; the settlement record itself is
+                        # already on disk.
+                        logger.exception(
+                            "settlement poller: risk.record_settlement failed for %s",
+                            d.ticker,
+                        )
 
             # Rate-limit: modest sleep between markets to stay under
             # the REST quota even when backlog is large. Skippable if
