@@ -42,13 +42,35 @@ fi
 pip install -e '.[agent]' --quiet
 echo "    ok"
 
-# Python 3.14 added a security check that skips .pth files with the
-# macOS UF_HIDDEN flag set. On this project's path (which contains a
-# space) Finder and some backup tools set that flag, breaking the
-# editable install silently. Clear the flag on every .pth in the
-# venv site-packages so `import tennis_edge` works.
+# Python 3.14 added a site.py security check that skips .pth files
+# with the macOS UF_HIDDEN flag set. On macOS hosts where the project
+# lives under iCloud-synced Desktop/Documents, that flag gets re-set
+# automatically by the sync agent, so `chflags nohidden` does not
+# stick across sessions.
+#
+# Workaround: install a sitecustomize.py (a regular Python module,
+# no hidden-flag check) that injects src/ into sys.path. site.py
+# imports sitecustomize before user code runs, so editable mode
+# works regardless of the .pth flag state.
 SITE_PKG=$(python -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || echo "")
 if [[ -n "$SITE_PKG" && -d "$SITE_PKG" ]]; then
+    PROJECT_SRC="$PROJECT_ROOT/src"
+    cat > "$SITE_PKG/sitecustomize.py" <<EOF
+"""Project-local sitecustomize. Adds src/ to sys.path.
+
+Workaround for Python 3.14 + macOS iCloud sync silently flagging
+.pth files as hidden, which site.py then ignores. See
+scripts/macmini_bootstrap.sh for the full story.
+"""
+import sys, os
+_SRC = "$PROJECT_SRC"
+if os.path.isdir(_SRC) and _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+EOF
+    echo "    sitecustomize.py installed → $SITE_PKG"
+    # Belt-and-suspenders: also clear the hidden flag on .pth files.
+    # If iCloud re-flags them later, sitecustomize keeps things
+    # working anyway.
     chflags nohidden "$SITE_PKG"/*.pth 2>/dev/null || true
 fi
 echo
