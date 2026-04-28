@@ -14,6 +14,33 @@ from .utils.logging import setup_logging
 console = Console()
 
 
+def _load_dotenv(project_root: Path) -> None:
+    """Load `.env` from project root into os.environ.
+
+    Tiny inline implementation so we do not pull a dotenv dependency.
+    Skips comments, blank lines, and any line lacking '='. Does not
+    overwrite values already in os.environ (env > .env, the standard
+    precedence).
+
+    `.env` is gitignored. It is the canonical place for secrets like
+    TENNIS_EDGE_GEMINI_KEY and TENNIS_EDGE__KALSHI__API_KEY_ID on
+    developer machines.
+    """
+    import os as _os
+    env_file = project_root / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in _os.environ:
+            _os.environ[key] = value
+
+
 @click.group()
 @click.option(
     "--config", "-c",
@@ -31,6 +58,11 @@ def main(ctx: click.Context, config: str | None) -> None:
         pkg_dir = Path(__file__).parent.parent.parent
         default = pkg_dir / "config" / "default.yaml"
         config = str(default) if default.exists() else None
+
+    # Load .env BEFORE load_config so any TENNIS_EDGE__* env-var
+    # overrides take effect.
+    if config is not None:
+        _load_dotenv(Path(config).parent.parent)
 
     cfg = load_config(config)
     setup_logging(cfg.logging.level, str(Path(cfg.project_root) / cfg.logging.file))
@@ -898,7 +930,34 @@ def agent_start(
                 min_edge=cfg.strategy.min_edge,
             )
 
-            auth = KalshiAuth(cfg.kalshi.api_key_id, str(key_path))
+            # Kalshi auth: only required for `--executor live` (real
+            # orders need RSA-PSS signing). For paper mode, public
+            # REST endpoints (get_markets, get_orderbook) work fine
+            # without auth, and place_order goes through
+            # PaperTradingEngine entirely.
+            auth: KalshiAuth | None = None
+            if cfg.kalshi.api_key_id and key_path.is_file():
+                try:
+                    auth = KalshiAuth(cfg.kalshi.api_key_id, str(key_path))
+                except Exception as e:
+                    if executor == "live":
+                        console.print(
+                            f"[red]Kalshi auth failed (required for live "
+                            f"mode): {e}[/red]"
+                        )
+                        return
+                    console.print(
+                        f"[yellow]Kalshi auth not available; running paper "
+                        f"mode against public REST only.[/yellow]"
+                    )
+            elif executor == "live":
+                console.print(
+                    "[red]--executor live requires Kalshi auth: set "
+                    "TENNIS_EDGE__KALSHI__API_KEY_ID and ensure "
+                    "config/kalshi_private_key.pem exists.[/red]"
+                )
+                return
+
             async with KalshiClient(cfg.kalshi, auth) as kalshi_client:
                 runtime = AgentRuntime(
                     db=db, tracker=tracker, builder=builder, model=predictor,
