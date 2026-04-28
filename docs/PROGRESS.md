@@ -255,6 +255,42 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Phase 3 v2.1: Aggressive Research Prompt + system_instruction + key_risk
+
+After hand-running the agent on MacBook for the demo prep, the prompt was upgraded based on feedback from David's manual workflow ("my Gemini analyst auto-researches rankings, H2H, surface form, fatigue, injuries — make our agent prompt push for the same"):
+
+**Three changes**:
+
+1. **Persona moved to `system_instruction`**. Previously the "you are a quant analyst" framing was embedded in the user prompt body. Now it's a separate `SYSTEM_INSTRUCTION_GROUNDED_V1` constant passed via `GenerateContentConfig.system_instruction`. Cleaner architecturally — per-request user content can focus on market context, persona doesn't get overwritten by static context. Google's API also caches system instructions more aggressively.
+
+2. **Aggressive research checklist** (9 items, in order):
+   1. Live match state (most decisive — settled markets must not be faded)
+   2. Current ATP/WTA rankings + trajectory
+   3. Career H2H including surface and last-12-month breakdown
+   4. Recent form (last 5-10 matches, opponent quality)
+   5. Surface specialty / tournament fit
+   6. Injury / fitness reports (last 7 days)
+   7. Fatigue load (matches in last 7 days, late finishes, time zones)
+   8. Environmental (altitude, court speed, weather)
+   9. Off-court alpha (equipment, coaching, motivation)
+
+   Previous prompt had 4 generic items; new one matches what an actual hedge-fund analyst's checklist looks like.
+
+3. **`EvAnalysis.key_risk: str | None`** — new optional field for the single biggest risk to the call. Lets post-mortem analytics group losing decisions by risk class ("which kind of risk is biting us most — injuries, fatigue, altitude, or live-state uncertainty?"). Backward compatible with v2.0 logged decisions.
+
+**Honest pushback on the analyst's other suggestions**:
+- Live performance metrics (1st serve %, rally length, unforced errors) — **rejected**, we don't have them. ESPN free covers Main only; Sofascore blocked; paid feeds out of budget. The whole reason v2 uses grounded search is precisely because we don't have streaming data.
+- Decimal odds format ("1.65x") — **rejected**, Kalshi trades binary 0-100¢ contracts.
+- Stop-loss triggers / hedge recommendations — **rejected**, position management is Phase 3D scope, not v2.
+- "High-frequency EV correction" — **rejected**, every grounded call is ~$0.015. 1-min cooldown vs 5-min cooldown = 14× cost increase for noise-level price changes.
+
+**Eval re-run after upgrade**: 5/5 pass. Reasoning quality measurably better — `settled_market_no_fade` now cites specific sources ("beIN Sports, Olympics.com, Tennis Now"), `prematch_strong_favorite` reasons more transparently about static-vs-live tradeoff. **Critically: the v1 failure-mode regression test (`extreme_low_price`) still SKIPs correctly with edge_est=0.03 matching market. The v2 thesis holds.**
+
+Cost per call ~$0.015-0.025 (slight increase from more aggressive search; still well under budget).
+
+Default suite: **227 passed** (225 prior + 2 new system_instruction tests).
+Eval suite: **5/5 passed @ ~$0.10** (slightly higher than v2.0 due to more search hops).
+
 ### April 19, 2026 — Phase 3 v2 Refactor: Single-Process Agent (No Tick-Logger Dependency)
 
 **Why**: when prepping a MacBook demo for teammates, the original v2 architecture's split between `tick-logger` (writes `market_ticks` SQLite table) and `agent` (reads it for post-LLM edge re-check) made for awkward UX — two processes to start, ~60s wait for fresh ticks before the agent could trade. For both demo and operational simplicity, the agent should be a single self-contained process.

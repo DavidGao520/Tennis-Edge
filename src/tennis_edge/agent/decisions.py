@@ -69,6 +69,12 @@ class EvAnalysis(BaseModel):
     reasoning: str = Field(max_length=2000)
     key_factors: list[str] = Field(default_factory=list, max_length=5)
 
+    # Optional: the single biggest risk to this call. Free-text; used
+    # for post-mortem analytics (group losing decisions by risk class
+    # to see whether injuries, fatigue, or altitude bites us most).
+    # Optional for backward compatibility with v2.0 logged decisions.
+    key_risk: str | None = Field(default=None, max_length=500)
+
 
 class AgentDecision(BaseModel):
     """One full decision record. Append-only.

@@ -144,44 +144,56 @@ schema. edge_estimate is your probability, not the gap vs market.
 """
 
 
-PROMPT_TEMPLATE_GROUNDED_V1 = """You are a quantitative analyst for a Kalshi tennis prediction market. You have access to Google Search and you SHOULD use it to look up live information before answering.
+SYSTEM_INSTRUCTION_GROUNDED_V1 = """You are a Chief Quantitative Analyst at a tennis-focused prediction-market hedge fund. Your verdicts directly drive Kelly-sized position taking on Kalshi binary contracts (0-100 cent YES/NO), so be calibrated and explicit about confidence.
 
-Market: {ticker}
-Outcome: YES = "{player_yes} wins", NO = "{player_no} wins"
-Context: {tournament}, {round_name}, {surface}, best-of-{best_of}
-Kalshi YES market price: {market_yes_cents}c (implied P = {market_prob:.3f})
+You have Google Search. Use it AGGRESSIVELY for every analysis. Static features you receive are weak (especially for ATP/WTA Challenger players we have thin DB coverage on); the live web is where the real edge comes from.
 
-Pre-match model anchor (informational only, may be unreliable for low-coverage players): P({player_yes} wins) = {model_pre_match:.3f}
+Output STRICT JSON only. No preamble, no markdown fences."""
 
-Static data we have on file:
-- {player_yes}: {yes_form_last10}, {yes_rest} since last match
-- {player_no}: {no_form_last10}, {no_rest} since last match
-- Head-to-head: {h2h_summary}
+
+PROMPT_TEMPLATE_GROUNDED_V1 = """## Market
+- Ticker: {ticker}
+- Outcome: YES = "{player_yes} wins", NO = "{player_no} wins"
+- Tournament: {tournament}, {round_name}, {surface}, best-of-{best_of}
+- Kalshi YES price: {market_yes_cents}c (implied P = {market_prob:.3f})
+
+## Static features (we already have these — low-coverage players: treat as approximate)
+- Pre-match Glicko-2 anchor: P({player_yes} wins) = {model_pre_match:.3f}
+- {player_yes}: {yes_form_last10}, last match {yes_rest} ago
+- {player_no}: {no_form_last10}, last match {no_rest} ago
+- Head-to-head on file: {h2h_summary}
 
 {extra_notes}
 
-CRITICAL: Use Google Search to verify the LIVE state of this match before answering. Specifically search for:
-1. Is this match currently in progress? If yes, what is the current set/game score?
-2. Is either player carrying an injury or fitness concern? Recent news from the last 7 days?
-3. Did either player play yesterday? Long match? Late finish?
-4. Surface-specific form for this tournament's conditions.
+## Research checklist (use Google Search — every item, in order)
 
-If the match is already in progress or finished, the Kalshi market price reflects the current/final state. In that case, your edge_estimate should be near the market price (no fade against a settled outcome).
+1. **Live match state**: Is this match in progress, finished, or pre-match? If live or settled, the Kalshi price already reflects the current/final state — anchor your edge_estimate to the market price, do NOT fade settled outcomes.
+2. **Current rankings**: ATP/WTA singles ranking for both players. Recent trajectory (rising / falling / returning from injury)?
+3. **Head-to-head**: career H2H including surface and last 12 months. Override the static H2H if web data is more current.
+4. **Recent form**: last 5-10 matches. Quality of opponents (top-50 wins? lost to qualifiers?).
+5. **Surface specialty**: career win% on this surface. How does each player adapt to this tournament's specific conditions?
+6. **Injury / fitness reports**: news in the last 7 days. Recent retirements, withdrawals, or visible struggles?
+7. **Fatigue load**: matches in last 7 days, late-night finishes, time-zone changes.
+8. **Environmental factors**: court speed, altitude (Madrid clay plays fast; Mexico City extremely fast), weather (humidity / wind).
+9. **Off-court alpha**: equipment / coaching changes, motivation (hometown event, ranking points to defend, Slam preparation).
 
-If the match is pre-match, weigh live news against static features. Tennis upsets driven by off-court factors (motivation, late-night travel, equipment changes) are exactly what static models miss.
+If your search returns nothing useful (thin coverage Challenger event, fictional players in test prompts), state that explicitly in `reasoning` and lean toward SKIP / lower confidence — DO NOT fabricate.
 
-If your search returns nothing useful for this match (Challenger tournaments often have thin coverage), say so in `reasoning` and lean toward SKIP / lower confidence rather than fabricating context.
+## Output (STRICT JSON, no other text)
 
-Output STRICT JSON matching this schema:
 {{
-  "edge_estimate": <float 0..1, your true P(YES wins)>,
+  "edge_estimate": <float 0..1; YOUR estimate of P(YES wins). NOT the gap vs market.>,
   "recommendation": "BUY_YES" | "BUY_NO" | "SKIP",
   "confidence": "low" | "medium" | "high",
-  "reasoning": "<2-3 sentences. Cite which live facts changed your view vs the static features. If you searched and found nothing, say so.>",
-  "key_factors": ["<up to 5 short bullet strings of the most decisive points>"]
+  "reasoning": "<2-4 sentences. Cite which live findings drove the view. If multi-source consensus, mention it. If thin data, say so.>",
+  "key_risk": "<one short sentence: the single biggest risk that could blow up this call. e.g. 'undisclosed injury for {player_yes}', 'altitude favors short rallies which {player_no} excels at', 'could not verify live score'.>",
+  "key_factors": ["<up to 5 short bullets of the most decisive findings>"]
 }}
 
-edge_estimate is your true probability, NOT the gap vs market.
+`confidence`:
+- high: clear thesis, multiple independent web sources confirm, no major contradictions
+- medium: thesis holds but one or two factors uncertain
+- low: thin data, contradictory signals, or could not verify live state
 """
 
 
@@ -707,11 +719,15 @@ class GeminiGroundedProvider(GeminiProvider):
         return PROMPT_TEMPLATE_GROUNDED_V1
 
     def _build_config(self):
-        # Google Search tool. Per the SDK contract, response_schema is
-        # not set — relying on prompt-level shape spec + pydantic
-        # validation (proven at smoke test).
+        # Google Search tool + persona via system_instruction. Per the
+        # SDK contract, response_schema is not set with tools — relying
+        # on prompt-level shape spec + pydantic validation (proven at
+        # smoke test). System instruction holds the persona and the
+        # "use Search aggressively" directive so the per-request user
+        # prompt can focus on the specific market context.
         return self._types.GenerateContentConfig(
             response_mime_type="application/json",
             tools=[self._types.Tool(google_search=self._types.GoogleSearch())],
+            system_instruction=SYSTEM_INSTRUCTION_GROUNDED_V1,
             max_output_tokens=self.max_output_tokens,
         )

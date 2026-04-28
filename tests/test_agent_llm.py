@@ -356,6 +356,41 @@ def test_grounded_provider_config_drops_response_schema(tmp_path):
     assert config.response_schema is None
 
 
+def test_grounded_provider_passes_system_instruction(tmp_path):
+    """v2.1: persona moved from prompt body into system_instruction
+    so the per-request user content can focus on market context. The
+    config MUST include the analyst persona text in system_instruction;
+    if it ever drops back to the prompt body the test catches it."""
+    from tennis_edge.agent.llm import (
+        GeminiGroundedProvider,
+        SYSTEM_INSTRUCTION_GROUNDED_V1,
+    )
+
+    bt = BudgetTracker(tmp_path / "b.json", {})
+    p = GeminiGroundedProvider(
+        model="gemini-3.1-pro-preview",
+        rates=PricingRates(1.0, 2.0, 3.0),
+        budget=bt,
+        api_key="test-key",
+    )
+    config = p._build_config()
+    assert config.system_instruction is not None
+    si = str(config.system_instruction)
+    # Persona present.
+    assert "Chief Quantitative Analyst" in si
+    # The Search-aggressively directive is in system instruction now.
+    assert "Google Search" in si or "google search" in si.lower()
+
+
+def test_grounded_provider_system_instruction_constant_exposed():
+    """The system instruction is a module-level constant so tests
+    and downstream tooling (eval suite, future Claude provider) can
+    reference it by name."""
+    from tennis_edge.agent.llm import SYSTEM_INSTRUCTION_GROUNDED_V1
+    assert "Chief Quantitative Analyst" in SYSTEM_INSTRUCTION_GROUNDED_V1
+    assert "Kalshi" in SYSTEM_INSTRUCTION_GROUNDED_V1
+
+
 def test_grounded_provider_uses_distinct_budget_key(tmp_path):
     """Provider name should be suffixed with '-grounded' so the
     BudgetTracker accumulates grounded spend in a separate bucket
@@ -422,21 +457,32 @@ def test_ungrounded_provider_template_unchanged(tmp_path):
     assert config.tools is None or config.tools == []
 
 
-def test_grounded_prompt_template_has_search_directive():
-    """The grounded prompt MUST instruct the model to use Google Search.
-    Without this directive, the tool is available but unused — same as
-    ungrounded mode."""
+def test_grounded_prompt_template_has_required_sections():
+    """The grounded user-prompt template MUST include the per-request
+    market context, the research checklist, and the JSON output spec.
+    The persona/Search directive lives in system_instruction (tested
+    separately).
+
+    Without the search checklist the model may answer from priors
+    only, defeating the whole point of v2."""
     from tennis_edge.agent.llm import PROMPT_TEMPLATE_GROUNDED_V1
 
-    assert "Google Search" in PROMPT_TEMPLATE_GROUNDED_V1
     # Must include the JSON schema instructions inline since
     # response_schema is dropped.
     assert "edge_estimate" in PROMPT_TEMPLATE_GROUNDED_V1
     assert "recommendation" in PROMPT_TEMPLATE_GROUNDED_V1
     assert "confidence" in PROMPT_TEMPLATE_GROUNDED_V1
+    # New v2.1 field — the single biggest risk.
+    assert "key_risk" in PROMPT_TEMPLATE_GROUNDED_V1
     # Must explicitly tell the model not to trade against settled
     # outcomes (the v1 failure mode this lane fixes).
-    assert "settled" in PROMPT_TEMPLATE_GROUNDED_V1.lower() or "in progress" in PROMPT_TEMPLATE_GROUNDED_V1.lower()
+    assert (
+        "settled" in PROMPT_TEMPLATE_GROUNDED_V1.lower()
+        or "in progress" in PROMPT_TEMPLATE_GROUNDED_V1.lower()
+    )
+    # v2.1 research checklist — at least the canonical items.
+    for item in ("ranking", "head-to-head", "form", "surface", "injur", "fatigue"):
+        assert item in PROMPT_TEMPLATE_GROUNDED_V1.lower(), f"missing: {item}"
 
 
 # ---------------------------------------------------------------------------
