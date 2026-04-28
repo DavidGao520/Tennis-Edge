@@ -367,7 +367,7 @@ class SafetyMonitor:
         self,
         *,
         ws: _WSProto,
-        db_path: str | os.PathLike[str],
+        db_path: str | os.PathLike[str] | None,
         budget: _BudgetProto,
         providers: list[str],
         risk: _RiskProto,
@@ -376,9 +376,15 @@ class SafetyMonitor:
     ) -> None:
         """Run all periodic checks until the monitor is KILLED.
 
-        Called once from the daemon; lives alongside the LLM worker
-        and the DB-tail reader. Exits cleanly when any kill switch
-        trips — the daemon checks is_killed() on its own schedule.
+        Called once from the daemon; exits cleanly when any kill
+        switch trips. The daemon checks `is_killed()` on its own
+        schedule.
+
+        `db_path` is optional. Passing None opts out of the
+        TICK_LOGGER_STALE check — appropriate when the agent is
+        running self-contained (MonitorBridge owns its own data
+        path) and there is no separate tick-logger process whose
+        liveness we need to monitor.
         """
         logger.info("safety: watchdog started, interval=%.0fs", interval_s)
         try:
@@ -399,9 +405,10 @@ class SafetyMonitor:
                     await self.check_ws(ws, live_match_fn)
                     if self.is_killed():
                         break
-                    await self.check_tick_logger(db_path)
-                    if self.is_killed():
-                        break
+                    if db_path is not None:
+                        await self.check_tick_logger(db_path)
+                        if self.is_killed():
+                            break
 
                 await asyncio.sleep(interval_s)
         except asyncio.CancelledError:

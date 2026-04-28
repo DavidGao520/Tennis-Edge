@@ -255,6 +255,43 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Phase 3 v2 Refactor: Single-Process Agent (No Tick-Logger Dependency)
+
+**Why**: when prepping a MacBook demo for teammates, the original v2 architecture's split between `tick-logger` (writes `market_ticks` SQLite table) and `agent` (reads it for post-LLM edge re-check) made for awkward UX — two processes to start, ~60s wait for fresh ticks before the agent could trade. For both demo and operational simplicity, the agent should be a single self-contained process.
+
+**Architectural decision change**: this overrides the original eng-review Q1 fork ("Tick source = DB tail from market_ticks"). New design:
+
+- **AgentLoop's post-LLM price re-check now pulls from a callable** (`PriceSource = Callable[[str], tuple[int, float] | None]`), returning `(yes_cents, age_seconds)` for the most recent observation.
+- **Production wiring**: `price_source = bridge.latest_price` — `MonitorBridge` already polls Kalshi REST every 15s for opportunity scanning, so it has fresh per-ticker prices already; just expose them.
+- **Tick-logger stays useful**: still runs on Mac mini, still feeds `market_ticks` for Anthony's backtest engine. Decoupled from agent runtime.
+
+**Code changes**:
+- `agent/monitor_bridge.py`: new `_last_prices: dict[str, (cents, monotonic_ts)]` cache populated on every `_analyze_one` call (even for tickers the signal filter rejects — AgentLoop may need them later). New method `latest_price(ticker) -> (cents, age_s) | None`.
+- `agent/loop.py`: replaced `tick_db_path: str` constructor param with `price_source: PriceSource`. Deleted `_TickReader` class and its `_TickRow` dataclass. `_post_llm_edge_check` now calls `self.price_source(ticker)` and rejects if age > 75s (5x the bridge's poll_interval, generous safety ceiling).
+- `agent/safety.py`: `watchdog_loop` parameter `db_path` is now optional. When None, the `TICK_LOGGER_STALE` check is skipped — appropriate when the agent is self-contained.
+- `cli.py`: bridge constructed first with `on_signal=lambda sig: agent_loop.on_signal(sig)` (late-bound closure), then `AgentLoop(price_source=bridge.latest_price, ...)`. `safety.watchdog_loop` called with `db_path=None`.
+
+**Tradeoffs (locked in)**:
+
+| | Before (DB tail) | After (bridge cache) |
+|---|---|---|
+| Re-check price freshness | ~2s | up to 15s |
+| Processes per agent deployment | 2 | 1 |
+| Operational overhead | tick-logger must be running | none |
+| Backtest data collection | shared with agent | independent on Mac mini |
+
+For a system with 5-minute per-ticker cooldown and 30-second LLM thinks, the 13-second freshness delta is irrelevant. The operational simplification is large.
+
+**Test updates**:
+- New `FakePriceSource` class in `test_agent_loop.py` (mimics the `MonitorBridge.latest_price` contract). Tests inject prices via `prices.set(ticker, cents, age_s)` instead of writing SQLite rows.
+- 5 old `_TickReader` tests deleted. Replaced with 4 `FakePriceSource` tests verifying the contract.
+- 4 new `MonitorBridge.latest_price` tests: returns None for unseen ticker, caches after scan, caches even filter-rejected tickers, age grows with time.
+- All 25 AgentLoop behavior tests still pass with the new wiring.
+
+Full suite: **225 passed** (222 prior + 4 new + 4 new − 5 deleted = +3 net), 5 deselected (eval).
+
+**Net**: a bare `tennis-edge agent start` now spins up MonitorBridge + AgentLoop + SettlementPoller + SafetyMonitor in a single process. No prerequisites beyond model artifact + `.env`. The agent is the agent.
+
 ### April 19, 2026 — Phase 3 v2 Step 8: Gemini Eval Suite (Required Regression Gate)
 
 **Built**: `tests/test_agent_gemini_eval.py` — required gate before any future change to `PROMPT_TEMPLATE_GROUNDED_V1` lands.

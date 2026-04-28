@@ -1,9 +1,9 @@
 """Tests for the v2 AgentLoop (signal subscriber + grounded gates + executor).
 
-Approach: structural fakes for everything injectable. Real SQLite for
-the post-LLM edge re-check (it queries the same `market_ticks` table
-shape as production). All paths are driven via `on_signal()` and
-`drain_once()` so there is no asyncio scheduling racing.
+Approach: structural fakes for everything injectable, including
+the price_source callable that AgentLoop uses for the post-LLM edge
+re-check. All paths driven via `on_signal()` and `drain_once()` so
+there is no asyncio scheduling racing.
 
 Coverage targets these critical paths from the eng review:
   - confidence=low → HARD reject
@@ -13,12 +13,16 @@ Coverage targets these critical paths from the eng review:
   - 3 consecutive order failures → safety counter trips kill switch
   - shadow vs auto mode both go through the same gate, only the
     injected ExchangeClient differs
+
+Note: the v2 architecture decouples agent from any tick-logger DB.
+AgentLoop pulls fresh prices from a callable (`price_source`) which
+in production is `MonitorBridge.latest_price`. Tests inject a small
+FakePriceSource dict.
 """
 
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 import time
 from pathlib import Path
 
@@ -38,7 +42,6 @@ from tennis_edge.agent.loop import (
     AgentLoop,
     AgentLoopConfig,
     Candidate,
-    _TickReader,
 )
 from tennis_edge.agent.monitor_bridge import MonitorSignal
 from tennis_edge.agent.safety import SafetyConfig, SafetyMonitor, SafetyState
@@ -49,42 +52,34 @@ from tennis_edge.strategy.risk import RiskManager
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Fake price source (replaces SQLite tick reader from v2.0)
 # ---------------------------------------------------------------------------
 
 
-def _make_tick_db(path: Path) -> None:
-    conn = sqlite3.connect(path)
-    conn.execute(
-        """
-        CREATE TABLE market_ticks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticker TEXT NOT NULL,
-            ts INTEGER NOT NULL,
-            yes_bid INTEGER, yes_ask INTEGER,
-            last_price INTEGER, volume INTEGER,
-            received_at INTEGER NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+class FakePriceSource:
+    """Mimics MonitorBridge.latest_price.
 
+    Stores per-ticker (yes_cents, monotonic_ts). Constructor accepts
+    either fresh entries (age computed at lookup) or aged entries
+    (stored age applied directly). Returns None for unknown tickers.
+    """
 
-def _insert_tick(
-    path: Path, ticker: str, received_at: int,
-    last_price: int | None = None,
-    yes_bid: int | None = None, yes_ask: int | None = None,
-) -> None:
-    conn = sqlite3.connect(path)
-    conn.execute(
-        "INSERT INTO market_ticks "
-        "(ticker, ts, yes_bid, yes_ask, last_price, volume, received_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (ticker, received_at, yes_bid, yes_ask, last_price, 1, received_at),
-    )
-    conn.commit()
-    conn.close()
+    def __init__(self):
+        self._prices: dict[str, tuple[int, float]] = {}
+
+    def set(self, ticker: str, cents: int, age_s: float = 0.0) -> None:
+        """Set price with age `age_s` seconds in the past."""
+        self._prices[ticker] = (cents, time.monotonic() - age_s)
+
+    def clear(self, ticker: str) -> None:
+        self._prices.pop(ticker, None)
+
+    def __call__(self, ticker: str) -> tuple[int, float] | None:
+        cached = self._prices.get(ticker)
+        if cached is None:
+            return None
+        cents, observed_at = cached
+        return cents, time.monotonic() - observed_at
 
 
 def _signal(
@@ -149,17 +144,20 @@ def _make_loop(
     *,
     llm: FakeLLMProvider | None = None,
     exchange=None,
-    fresh_tick_at_market: int | None = None,
+    fresh_price_at: int | None = None,
     config_overrides: dict | None = None,
-) -> tuple[AgentLoop, Path, FakeLLMProvider, DecisionLog, SafetyMonitor, RiskManager]:
-    db = tmp_path / "ticks.db"
-    _make_tick_db(db)
-    if fresh_tick_at_market is not None:
-        _insert_tick(
-            db, "KXATPMATCH-T1",
-            received_at=int(time.time()),
-            last_price=fresh_tick_at_market,
-        )
+) -> tuple[
+    AgentLoop, FakePriceSource, FakeLLMProvider, DecisionLog,
+    SafetyMonitor, RiskManager,
+]:
+    """Build a wired AgentLoop with fakes for every dependency.
+
+    Returns the loop, the price source (so tests can mutate it
+    mid-test), and the other handles tests assert against.
+    """
+    price_source = FakePriceSource()
+    if fresh_price_at is not None:
+        price_source.set("KXATPMATCH-T1", fresh_price_at, age_s=0.0)
 
     safety = SafetyMonitor(SafetyConfig(control_dir=str(tmp_path / "ctrl")))
     decisions = DecisionLog(tmp_path / "d.jsonl", tmp_path / "s.jsonl")
@@ -198,48 +196,46 @@ def _make_loop(
         risk=risk,
         exchange=exchange,
         prompt_builder=_build_ctx,
-        tick_db_path=db,
+        price_source=price_source,
     )
-    return loop, db, llm, decisions, safety, risk
+    return loop, price_source, llm, decisions, safety, risk
 
 
 # ---------------------------------------------------------------------------
-# _TickReader
+# FakePriceSource (mirrors MonitorBridge.latest_price contract)
 # ---------------------------------------------------------------------------
 
 
-def test_tick_reader_returns_latest(tmp_path):
-    db = tmp_path / "t.db"
-    _make_tick_db(db)
-    now = int(time.time())
-    _insert_tick(db, "T1", now - 10, last_price=15)
-    _insert_tick(db, "T1", now, last_price=18)
-    r = _TickReader(db)
-    row = r.latest_for_ticker("T1")
-    assert row is not None
-    assert row.last_price == 18
+def test_price_source_returns_none_for_unknown_ticker():
+    src = FakePriceSource()
+    assert src("MISSING") is None
 
 
-def test_tick_reader_returns_none_for_unknown(tmp_path):
-    db = tmp_path / "t.db"
-    _make_tick_db(db)
-    assert _TickReader(db).latest_for_ticker("MISSING") is None
+def test_price_source_returns_cents_and_age():
+    src = FakePriceSource()
+    src.set("T1", 42, age_s=0.0)
+    out = src("T1")
+    assert out is not None
+    cents, age = out
+    assert cents == 42
+    assert 0.0 <= age < 0.5  # just-set should be near-zero age
 
 
-def test_tick_reader_returns_none_when_db_missing(tmp_path):
-    assert _TickReader(tmp_path / "nope.db").latest_for_ticker("X") is None
+def test_price_source_age_grows_with_time():
+    src = FakePriceSource()
+    src.set("T1", 50, age_s=10.0)
+    out = src("T1")
+    assert out is not None
+    _, age = out
+    # We injected age=10 → result should be ≥10s.
+    assert age >= 10.0
 
 
-def test_tick_reader_price_cents_prefers_last(tmp_path):
-    from tennis_edge.agent.loop import _TickRow
-    row = _TickRow(ticker="T", received_at=0, yes_bid=40, yes_ask=50, last_price=45)
-    assert _TickReader.price_cents(row) == 45
-
-
-def test_tick_reader_price_cents_falls_back_to_mid(tmp_path):
-    from tennis_edge.agent.loop import _TickRow
-    row = _TickRow(ticker="T", received_at=0, yes_bid=40, yes_ask=50, last_price=None)
-    assert _TickReader.price_cents(row) == 45
+def test_price_source_clear():
+    src = FakePriceSource()
+    src.set("T1", 50)
+    src.clear("T1")
+    assert src("T1") is None
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +301,7 @@ async def test_worker_happy_path_executes_and_logs(tmp_path):
         edge_estimate=0.55, recommendation="BUY_YES", confidence="high",
     ))
     loop, _, _, decisions, _, risk = _make_loop(
-        tmp_path, llm=llm, fresh_tick_at_market=15,
+        tmp_path, llm=llm, fresh_price_at=15,
     )
     await loop.on_signal(_signal(ticker="KXATPMATCH-T1", market_yes_cents=15))
     await loop.drain_once()
@@ -331,7 +327,7 @@ async def test_worker_hard_rejects_low_confidence(tmp_path):
         edge_estimate=0.55, recommendation="BUY_YES", confidence="low",
     ))
     loop, _, _, decisions, _, risk = _make_loop(
-        tmp_path, llm=llm, fresh_tick_at_market=15,
+        tmp_path, llm=llm, fresh_price_at=15,
     )
     await loop.on_signal(_signal(market_yes_cents=15))
     await loop.drain_once()
@@ -350,7 +346,7 @@ async def test_worker_hard_rejects_grounded_edge_below_min(tmp_path):
         edge_estimate=0.18, recommendation="BUY_YES", confidence="high",
     ))
     loop, _, _, decisions, _, _ = _make_loop(
-        tmp_path, llm=llm, fresh_tick_at_market=15,
+        tmp_path, llm=llm, fresh_price_at=15,
     )
     await loop.on_signal(_signal(market_yes_cents=15))
     await loop.drain_once()
@@ -366,7 +362,7 @@ async def test_worker_hard_rejects_skip_recommendation(tmp_path):
         edge_estimate=0.50, recommendation="SKIP", confidence="medium",
     ))
     loop, _, _, decisions, _, _ = _make_loop(
-        tmp_path, llm=llm, fresh_tick_at_market=15,
+        tmp_path, llm=llm, fresh_price_at=15,
     )
     await loop.on_signal(_signal(market_yes_cents=15))
     await loop.drain_once()
@@ -384,15 +380,14 @@ async def test_worker_hard_rejects_post_llm_edge_stale(tmp_path):
     llm = FakeLLMProvider(analysis=_ev_analysis(
         edge_estimate=0.55, recommendation="BUY_YES", confidence="high",
     ))
-    loop, db, _, decisions, _, _ = _make_loop(tmp_path, llm=llm)
+    loop, prices, _, decisions, _, _ = _make_loop(tmp_path, llm=llm)
 
-    # Initial tick shows the low price the signal was based on
-    _insert_tick(db, "KXATPMATCH-T1", received_at=int(time.time()) - 30, last_price=15)
+    # Signal queued at 15c.
     await loop.on_signal(_signal(ticker="KXATPMATCH-T1", market_yes_cents=15))
 
-    # Insert fresher tick at 50c — market moved against us during
-    # Gemini's think.
-    _insert_tick(db, "KXATPMATCH-T1", received_at=int(time.time()), last_price=50)
+    # Bridge's most recent observation is now 50c — market moved
+    # against us during Gemini's think. Re-check at this price.
+    prices.set("KXATPMATCH-T1", 50, age_s=0.0)
 
     await loop.drain_once()
     d = list(decisions.iter_decisions())[0]
@@ -430,14 +425,14 @@ async def test_worker_rejects_when_risk_check_fails(tmp_path):
     llm = FakeLLMProvider(analysis=_ev_analysis(
         edge_estimate=0.55, recommendation="BUY_YES", confidence="high",
     ))
-    loop, db, _, decisions, _, risk = _make_loop(
+    loop, prices, _, decisions, _, risk = _make_loop(
         tmp_path, llm=llm,
         # Kelly bet ~$50 (Kelly_pct ≈ 0.118 × $1000 bankroll → cap $50).
         # Risk per-market cap = $60 → first $49.95 fits, second
         # would push to $99.90 > $60 → reject.
         config_overrides={"cooldown_s": 0.0},
     )
-    _insert_tick(db, "T1", received_at=int(time.time()), last_price=15)
+    prices.set("T1", 15)
     risk.config = RiskConfig(
         max_position_per_market=60.0,
         max_total_exposure=10000.0,
@@ -500,7 +495,7 @@ async def test_worker_release_on_place_order_exception(tmp_path):
     ))
     ex = _RaisingExchange(raises_n=1)
     loop, _, _, decisions, _, risk = _make_loop(
-        tmp_path, llm=llm, exchange=ex, fresh_tick_at_market=15,
+        tmp_path, llm=llm, exchange=ex, fresh_price_at=15,
     )
     await loop.on_signal(_signal())
     await loop.drain_once()
@@ -523,13 +518,13 @@ async def test_three_consecutive_order_failures_trip_kill(tmp_path):
         edge_estimate=0.55, recommendation="BUY_YES", confidence="high",
     ))
     ex = _RaisingExchange(raises_n=999)
-    # Need fresh tick for each ticker we drain.
-    loop, db, _, _, safety, _ = _make_loop(
-        tmp_path, llm=llm, exchange=ex, fresh_tick_at_market=15,
+    # Need fresh price for each ticker we drain.
+    loop, prices, _, _, safety, _ = _make_loop(
+        tmp_path, llm=llm, exchange=ex, fresh_price_at=15,
         config_overrides={"cooldown_s": 0.0},
     )
     for i in range(3):
-        _insert_tick(db, f"T{i}", received_at=int(time.time()), last_price=15)
+        prices.set(f"T{i}", 15)
 
     for i in range(3):
         await loop.on_signal(_signal(ticker=f"T{i}"))
@@ -548,7 +543,7 @@ async def test_three_consecutive_order_failures_trip_kill(tmp_path):
 async def test_worker_llm_failure_recorded_no_decision_logged(tmp_path):
     llm = FakeLLMProvider(raise_exc=LLMCallError("boom"))
     loop, _, _, decisions, safety, _ = _make_loop(
-        tmp_path, llm=llm, fresh_tick_at_market=15,
+        tmp_path, llm=llm, fresh_price_at=15,
     )
     await loop.on_signal(_signal())
     await loop.drain_once()
@@ -561,7 +556,7 @@ async def test_worker_llm_failure_recorded_no_decision_logged(tmp_path):
 async def test_three_llm_failures_kill_safety(tmp_path):
     llm = FakeLLMProvider(raise_exc=LLMCallError("flake"))
     loop, _, _, _, safety, _ = _make_loop(
-        tmp_path, llm=llm, fresh_tick_at_market=15,
+        tmp_path, llm=llm, fresh_price_at=15,
         config_overrides={"cooldown_s": 0.0},
     )
     for i in range(3):
@@ -579,7 +574,7 @@ async def test_three_llm_failures_kill_safety(tmp_path):
 async def test_worker_drops_stale_candidate(tmp_path):
     llm = FakeLLMProvider()
     loop, _, _, decisions, _, _ = _make_loop(
-        tmp_path, llm=llm, fresh_tick_at_market=15,
+        tmp_path, llm=llm, fresh_price_at=15,
         config_overrides={"max_candidate_age_s": 0.001},
     )
     await loop.on_signal(_signal())
@@ -652,7 +647,7 @@ async def test_decision_log_carries_full_context(tmp_path):
         ),
     )
     loop, _, _, decisions, _, _ = _make_loop(
-        tmp_path, llm=llm, fresh_tick_at_market=15,
+        tmp_path, llm=llm, fresh_price_at=15,
     )
     await loop.on_signal(_signal(market_yes_cents=15))
     await loop.drain_once()

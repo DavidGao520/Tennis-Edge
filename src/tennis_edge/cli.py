@@ -929,6 +929,16 @@ def agent_start(
                         sig.ticker, sig.model_prob, sig.market_yes_cents,
                     )
 
+                bridge = MonitorBridge(
+                    client=kalshi_client,
+                    scanner=scanner,
+                    on_signal=lambda sig: agent_loop.on_signal(sig),  # late-bound
+                    config=bridge_cfg,
+                )
+
+                # AgentLoop's post-LLM price re-check pulls from the
+                # bridge's per-ticker price cache. Same single-process
+                # source of truth — no tick-logger DB read path.
                 agent_loop = AgentLoop(
                     config=loop_cfg,
                     safety=safety,
@@ -937,14 +947,7 @@ def agent_start(
                     risk=risk,
                     exchange=executor_client,
                     prompt_builder=prompt_builder,
-                    tick_db_path=db_path,
-                )
-
-                bridge = MonitorBridge(
-                    client=kalshi_client,
-                    scanner=scanner,
-                    on_signal=agent_loop.on_signal,
-                    config=bridge_cfg,
+                    price_source=bridge.latest_price,
                 )
 
                 settlement = SettlementPoller(
@@ -993,7 +996,12 @@ def agent_start(
                     settlement.run(),
                     safety.watchdog_loop(
                         ws=_DummyWS(),  # agent does not own a live WS
-                        db_path=db_path,
+                        # db_path=None: agent is self-contained in v2,
+                        # no separate tick-logger process whose
+                        # liveness we need to monitor. tick-logger
+                        # still runs on Mac mini for backtest data,
+                        # but the agent does not depend on it.
+                        db_path=None,
                         budget=budget,
                         providers=[grounded_provider_name],
                         risk=risk,

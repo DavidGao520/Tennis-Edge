@@ -207,6 +207,16 @@ class MonitorBridge:
         self._scan_count = 0
         self._signal_count = 0
 
+        # Per-ticker latest observed price cache. Populated on every
+        # scan from valid Opportunity objects (whether or not they
+        # passed the signal filters). AgentLoop consumes this for
+        # post-LLM edge re-check so it does not need a separate
+        # tick-logger DB read path.
+        #
+        # Value: (yes_cents, monotonic_ts at observation).
+        # Lookup: latest_price(ticker) -> (cents, age_seconds) | None.
+        self._last_prices: dict[str, tuple[int, float]] = {}
+
     def request_stop(self) -> None:
         """Stop the loop after the current scan completes."""
         self._stop.set()
@@ -217,6 +227,21 @@ class MonitorBridge:
             "scans": self._scan_count,
             "signals_emitted": self._signal_count,
         }
+
+    def latest_price(self, ticker: str) -> tuple[int, float] | None:
+        """Return (yes_cents, age_seconds) for the most recent scan
+        of `ticker`, or None if we have not seen it.
+
+        Used by AgentLoop's post-LLM edge re-check so the agent does
+        not need a separate tick-logger DB. Freshness is bounded by
+        `poll_interval_s` — at most 15s old in the default config.
+        """
+        cached = self._last_prices.get(ticker)
+        if cached is None:
+            return None
+        cents, observed_at = cached
+        age = time.monotonic() - observed_at
+        return cents, age
 
     async def run(self) -> None:
         """Main entry. Polls the scanner, emits signals, sleeps, repeats."""
@@ -298,7 +323,8 @@ class MonitorBridge:
         return out
 
     async def _analyze_one(self, market) -> MonitorSignal | None:
-        """Run the scanner on one market, then apply v2 filters."""
+        """Run the scanner on one market, cache its price, then apply
+        v2 filters and emit if the candidate passes."""
         # Orderbook is best-effort: scanner falls back to last_price /
         # market.yes_bid if orderbook fetch fails.
         try:
@@ -313,6 +339,17 @@ class MonitorBridge:
         opp = self.scanner.analyze_market_pair(market, None, ob, None)
         if opp is None:
             return None
+
+        # Cache the price BEFORE filtering. Even tickers that the
+        # signal filter rejects still have valid prices we want
+        # available for AgentLoop's post-LLM re-check (it may queue
+        # a candidate based on an earlier scan and want to re-check
+        # against this scan's price).
+        if opp.mid_price is not None:
+            self._last_prices[opp.ticker] = (
+                int(round(opp.mid_price)),
+                time.monotonic(),
+            )
 
         return self._opportunity_to_signal(opp)
 

@@ -429,6 +429,91 @@ async def test_run_loop_continues_after_scan_exception(caplog):
 
 
 @pytest.mark.asyncio
+async def test_latest_price_returns_none_when_unseen():
+    bridge = MonitorBridge(
+        FakeClient(), FakeScanner(),
+        on_signal=(lambda s: asyncio.sleep(0)),
+    )
+    assert bridge.latest_price("NEVER-SEEN") is None
+
+
+@pytest.mark.asyncio
+async def test_latest_price_caches_after_scan():
+    """After scan_once, every ticker the scanner produced an
+    Opportunity for has its mid_price cached."""
+    client = FakeClient(markets_by_series={
+        "KXATPMATCH": [FakeMarket("T1")],
+    })
+    scanner = FakeScanner(by_ticker={
+        "T1": _opp(ticker="T1", edge=0.20, mid=42.0),
+    })
+    bridge = MonitorBridge(
+        client, scanner,
+        on_signal=(lambda s: asyncio.sleep(0)),
+    )
+    await bridge.scan_once()
+
+    out = bridge.latest_price("T1")
+    assert out is not None
+    cents, age = out
+    assert cents == 42
+    assert age < 1.0  # just-cached, sub-second
+
+
+@pytest.mark.asyncio
+async def test_latest_price_caches_filtered_tickers_too():
+    """Even tickers the signal filter rejects (e.g., below min_ev)
+    have their prices cached. AgentLoop's post-LLM re-check needs
+    fresh prices for ALL tickers that have been scanned, not just
+    the ones that became signals — a candidate from an earlier scan
+    might pass through and need re-checking against this scan's
+    price."""
+    client = FakeClient(markets_by_series={
+        "KXATPMATCH": [FakeMarket("T1")],
+    })
+    scanner = FakeScanner(by_ticker={
+        # Edge 0.05 is below default min_prematch_ev (0.15) so this
+        # opportunity is rejected at the filter, but it still has a
+        # valid price.
+        "T1": _opp(ticker="T1", edge=0.05, mid=33.0),
+    })
+    bridge = MonitorBridge(
+        client, scanner,
+        on_signal=(lambda s: asyncio.sleep(0)),
+    )
+    n = await bridge.scan_once()
+
+    assert n == 0  # filter rejected the signal
+    out = bridge.latest_price("T1")
+    assert out is not None
+    assert out[0] == 33  # but price was cached anyway
+
+
+@pytest.mark.asyncio
+async def test_latest_price_age_grows_between_scans():
+    client = FakeClient(markets_by_series={
+        "KXATPMATCH": [FakeMarket("T1")],
+    })
+    scanner = FakeScanner(by_ticker={
+        "T1": _opp(ticker="T1", edge=0.20, mid=42.0),
+    })
+    bridge = MonitorBridge(
+        client, scanner,
+        on_signal=(lambda s: asyncio.sleep(0)),
+    )
+    await bridge.scan_once()
+    out1 = bridge.latest_price("T1")
+    assert out1 is not None
+    age1 = out1[1]
+
+    await asyncio.sleep(0.05)
+    out2 = bridge.latest_price("T1")
+    assert out2 is not None
+    age2 = out2[1]
+    assert age2 > age1
+
+
+@pytest.mark.asyncio
 async def test_stats_count_scans_and_signals():
     client = FakeClient(markets_by_series={
         "KXATPMATCH": [FakeMarket("T1")],

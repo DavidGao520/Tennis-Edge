@@ -55,14 +55,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Awaitable, Callable, Protocol
+from typing import Awaitable, Callable
 
 from ..exchange.base import ExchangeClient
 from ..exchange.schemas import OrderRequest
@@ -183,72 +180,16 @@ Returns None to skip this candidate without recording an LLM failure
 (e.g., Kalshi metadata fetch failed)."""
 
 
-# ---------------------------------------------------------------------------
-# Tick re-check helper (no DB tailing — query-only)
-# ---------------------------------------------------------------------------
+PriceSource = Callable[[str], "tuple[int, float] | None"]
+"""Return (yes_cents, age_seconds) for the most recent observation of
+this ticker, or None if not seen.
 
+Production wiring: `MonitorBridge.latest_price` — fed by the bridge's
+periodic Kalshi REST scan. Freshness bounded by the bridge's
+poll_interval_s (default 15s).
 
-@dataclass(frozen=True)
-class _TickRow:
-    ticker: str
-    received_at: int
-    yes_bid: int | None
-    yes_ask: int | None
-    last_price: int | None
-
-
-class _TickReader:
-    """Read-only point lookup against market_ticks. v2 uses this only
-    for the post-LLM edge re-check; the v1 tailing reader is gone.
-
-    Single-method API keeps the surface minimal: callers query
-    `latest_for_ticker(ticker)` and either get a row or None.
-    """
-
-    def __init__(self, db_path: str | os.PathLike[str]):
-        self.db_path = Path(db_path)
-
-    def latest_for_ticker(self, ticker: str) -> _TickRow | None:
-        uri = f"file:{os.fspath(self.db_path)}?mode=ro"
-        try:
-            conn = sqlite3.connect(uri, uri=True, timeout=2.0)
-        except sqlite3.OperationalError:
-            return None
-        try:
-            cur = conn.execute(
-                """
-                SELECT ticker, received_at, yes_bid, yes_ask, last_price
-                FROM market_ticks
-                WHERE ticker = ?
-                ORDER BY received_at DESC
-                LIMIT 1
-                """,
-                (ticker,),
-            )
-            row = cur.fetchone()
-        except sqlite3.OperationalError:
-            return None
-        finally:
-            conn.close()
-        if row is None:
-            return None
-        return _TickRow(
-            ticker=row[0], received_at=int(row[1]),
-            yes_bid=row[2], yes_ask=row[3], last_price=row[4],
-        )
-
-    @staticmethod
-    def price_cents(row: _TickRow) -> int | None:
-        """Best-effort YES price: last → mid → ask → bid → None."""
-        if row.last_price is not None:
-            return int(row.last_price)
-        if row.yes_bid is not None and row.yes_ask is not None:
-            return int((row.yes_bid + row.yes_ask) / 2)
-        if row.yes_ask is not None:
-            return int(row.yes_ask)
-        if row.yes_bid is not None:
-            return int(row.yes_bid)
-        return None
+Returning None means "no recent observation"; AgentLoop treats this as
+a hard reject (refuses to fill at unknown price)."""
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +211,7 @@ class AgentLoop:
         risk: RiskManager,
         exchange: ExchangeClient,
         prompt_builder: PromptBuilder,
-        tick_db_path: str | os.PathLike[str],
+        price_source: PriceSource,
         run_id: str | None = None,
     ):
         self.config = config
@@ -280,7 +221,7 @@ class AgentLoop:
         self.risk = risk
         self.exchange = exchange
         self.prompt_builder = prompt_builder
-        self.tick_reader = _TickReader(tick_db_path)
+        self.price_source = price_source
         self.queue: asyncio.Queue[Candidate] = asyncio.Queue(maxsize=config.queue_max)
         self.run_id = run_id or f"run-{uuid.uuid4().hex[:12]}"
 
@@ -531,21 +472,26 @@ class AgentLoop:
     def _post_llm_edge_check(
         self, analysis: EvAnalysis, ticker: str,
     ) -> tuple[float | None, str | None]:
-        """Re-read latest tick. Hard reject if edge collapsed.
+        """Re-read latest observed price via price_source. Hard reject
+        if edge collapsed against the freshest scan.
 
         Returns (edge_at_execution, reject_reason). edge_at_execution
-        may be non-None even when we reject — useful for shadow analytics.
+        may be non-None even when we reject — useful for shadow
+        analytics measuring how often the LLM's think-time costs us
+        the signal.
         """
-        latest = self.tick_reader.latest_for_ticker(ticker)
+        latest = self.price_source(ticker)
         if latest is None:
-            # No fresh tick. Be conservative — reject rather than fill
-            # at a possibly stale price. tick-logger gap is also a
-            # safety concern that the watchdog handles separately.
+            # No observation at all. Be conservative — refuse to fill
+            # at an unknown price.
             return None, "no_recent_tick"
 
-        latest_price = self.tick_reader.price_cents(latest)
-        if latest_price is None:
-            return None, "no_recent_price"
+        latest_price, age_s = latest
+        # An ancient price is no better than no price. Use 5x the
+        # bridge's typical scan interval as a safety ceiling: if the
+        # bridge has not seen this ticker in 75s, treat it as stale.
+        if age_s > 75.0:
+            return None, "no_recent_tick"
 
         market_prob = latest_price / 100.0
         if analysis.recommendation == "BUY_YES":
