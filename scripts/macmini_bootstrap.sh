@@ -41,6 +41,16 @@ if [[ -z "${VIRTUAL_ENV:-}" ]]; then
 fi
 pip install -e '.[agent]' --quiet
 echo "    ok"
+
+# Python 3.14 added a security check that skips .pth files with the
+# macOS UF_HIDDEN flag set. On this project's path (which contains a
+# space) Finder and some backup tools set that flag, breaking the
+# editable install silently. Clear the flag on every .pth in the
+# venv site-packages so `import tennis_edge` works.
+SITE_PKG=$(python -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || echo "")
+if [[ -n "$SITE_PKG" && -d "$SITE_PKG" ]]; then
+    chflags nohidden "$SITE_PKG"/*.pth 2>/dev/null || true
+fi
 echo
 
 # ---- 3. Model artifact ----
