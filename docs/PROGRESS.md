@@ -255,6 +255,41 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Phase 3 v2 Step 2: MonitorBridge
+
+**Built**: `src/tennis_edge/agent/monitor_bridge.py` — embedded scanner-runner that pushes filtered signals to `AgentLoop` via async callback. v2 replacement for v1's DB-tail reader.
+
+**Architecture**:
+- Periodic poll (~15s) over series whitelist via `KalshiClient.get_markets`
+- Per market: fetch orderbook → run `EVScanner.analyze_market_pair` → produce `Opportunity`
+- Three filters in order: series whitelist (category), price band (10-90c default), min prematch EV (0.15 default)
+- Pass-through emits `MonitorSignal` via `await on_signal(sig)` to consumer
+
+**`MonitorSignal` fields**: ticker, player_yes, player_no, category, market_yes_cents, model_prob, market_prob, prematch_ev, recommended_side, detected_at. Carries everything `AgentLoop.on_signal` will need without requiring it to recompute or look up.
+
+**Whitelists exposed as constants**:
+- `WHITELIST_ATP_WTA_MAIN` = `("KXATPMATCH", "KXWTAMATCH")` — Phase 3A v2 Week 1 default
+- `WHITELIST_ALL_TENNIS` = adds Challengers, for Week 2+
+
+**Robustness**:
+- `get_markets` failure on one series logs and continues to the next
+- Orderbook failure on one ticker → scanner runs with `ob=None` (falls back to last_price / yes_bid)
+- Consumer (`on_signal`) exception is logged but does NOT block the bridge from emitting subsequent signals — the bridge has to be more reliable than its consumer
+- `run()` loop survives a `scan_once` crash (logs + continues to next interval), exits promptly on `request_stop()`
+
+**Tests**: `tests/test_agent_monitor_bridge.py` — 21 cases.
+- `_category_passes` helper: 7 cases mapping Opportunity.category to series whitelist
+- `scan_once` happy path: signal emitted with correct fields
+- 4 filter rejection paths: below min EV, outside price band, mid_price=None, Challenger under Main whitelist
+- 1 positive: Challenger passes under full whitelist
+- Robustness: empty markets, None opportunity, get_markets exception isolated per series, orderbook exception falls through to scanner, crashing consumer doesn't kill bridge
+- `run()` loop: exits promptly on stop, survives scan exception
+- `stats` counts scans and signals correctly
+
+Full suite: **208 passed** (187 prior + 21 new).
+
+**Next**: Step 3 = `OrderRequest.client_order_id` plumbing (independent lane, takes ~1h). Then Step 4 = `AgentLoop` rewrite (depends on both Step 1 and Step 2).
+
 ### April 19, 2026 — Phase 3 v2 Step 0 + Step 1: Grounded Smoke + GeminiGroundedProvider
 
 **Step 0 grounded smoke** (5 min, before any code):
