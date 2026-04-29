@@ -27,13 +27,20 @@ to do.
 ## Branches and merges
 
 ```
-main      = production line, 258 tests passing
-  └── merged: phase-2 (agent work) and cli-ui (UI work)
-phase-2   = stays alive for Phase 3B/3C work; tracks main today
-cli-ui    = stays alive for further UI iteration
+main    = production line, 258 tests passing
+agent   = David's lane — Phase 3B/3C agent work, multi-provider LLM, ...
+cli     = teammate's lane — UI iteration, onboarding polish, ...
 ```
 
-When in doubt, branch off `main`.
+`agent` and `cli` branched off `main` after Phase 3A v2.1 was
+merged. Each lane lives on its own branch and merges back to
+`main` via `--no-ff` PRs. The old `phase-2` and `cli-ui` names
+were retired because they referred to phase-1-of-product-plan
+language that no longer matches.
+
+When in doubt, branch off `main`. Long-running `agent` / `cli`
+branches exist so the two contributors stay in their lanes
+without trampling each other.
 
 ---
 
@@ -248,9 +255,11 @@ override per-commit.
 ## Last verified state (replace this when you commit)
 
 - Date: April 28-29, 2026
-- main HEAD: `1fc194f` "Merge cli-ui: replace real key in mask test fixture"
+- Branches: `main` / `agent` / `cli` (renamed from `phase-2` / `cli-ui`)
+- main HEAD: latest merge, includes HANDOFF.md
 - Test suite: **258 passed, 5 deselected (eval)**
 - Latest eval run: 5/5 passed (April 19, ~$0.10)
-- Latest real Gemini smoke: passed (model lists 55 models OK)
+- Latest real Gemini smoke: passed (55 models accessible)
 - Kalshi balance: $500.44, 0 open positions
-- Active LLM provider: Gemini (rotated key after April 28 leak)
+- Active LLM provider: Gemini (rotated key after April 28 leak;
+  rotated again after pasting in chat — current key valid)
