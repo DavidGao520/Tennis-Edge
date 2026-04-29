@@ -49,19 +49,71 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 
+# LLM provider env-var registry. Single source of truth for which
+# providers exist and how to configure each one. Adding a new
+# provider = one entry here + a corresponding onboarding helper.
+LLM_PROVIDERS: dict[str, dict[str, str]] = {
+    "gemini": {
+        "label": "Gemini",
+        "vendor": "Google AI Studio",
+        "env_var": "TENNIS_EDGE_GEMINI_KEY",
+        "url": "https://aistudio.google.com/apikey",
+        "prefix": "AIza",
+        "status": "active",  # the agent's grounded provider runs Gemini today
+    },
+    "openai": {
+        "label": "OpenAI",
+        "vendor": "OpenAI Platform",
+        "env_var": "TENNIS_EDGE_OPENAI_KEY",
+        "url": "https://platform.openai.com/api-keys",
+        "prefix": "sk-",
+        "status": "saved",  # key saved; provider wiring to land in a future PR
+    },
+    "anthropic": {
+        "label": "Claude",
+        "vendor": "Anthropic Console",
+        "env_var": "TENNIS_EDGE_ANTHROPIC_KEY",
+        "url": "https://console.anthropic.com/settings/keys",
+        "prefix": "sk-ant-",
+        "status": "saved",
+    },
+}
+
+
+def _llm_present() -> bool:
+    """True if ANY supported LLM provider has a key configured."""
+    return any(os.environ.get(p["env_var"]) for p in LLM_PROVIDERS.values())
+
+
+def _active_llm_label() -> str | None:
+    """Which provider the agent is wired to use today, if its key is set.
+
+    Returns the label of the first 'status=active' provider whose env
+    var is populated, or None if no active provider has a key. Display
+    helper for the launch screen.
+    """
+    for p in LLM_PROVIDERS.values():
+        if p["status"] == "active" and os.environ.get(p["env_var"]):
+            return p["label"]
+    return None
+
+
 def check_setup(cfg) -> dict[str, bool]:
     """Return setup-completeness flags. Used by launch screen and
     onboarding to decide whether to nag.
 
     Keys:
-      gemini  Gemini API key set in env (loaded from .env at startup)
+      llm     Any supported LLM provider key set in env (Gemini /
+              OpenAI / Anthropic). Note: only Gemini is wired into
+              the agent's grounded path today; OpenAI / Anthropic
+              keys are saved for the upcoming multi-provider PR.
       kalshi  Kalshi api_key_id set AND PEM file present
       model   data/models/latest.joblib exists and is non-empty
       data    players table has rows
     """
     project_root = Path(cfg.project_root)
     return {
-        "gemini": bool(os.environ.get("TENNIS_EDGE_GEMINI_KEY")),
+        "llm": _llm_present(),
         "kalshi": _kalshi_auth_present(cfg),
         "model": _model_present(project_root, cfg),
         "data": _player_count(project_root / cfg.database.path) > 0,
@@ -151,7 +203,7 @@ def show_launch_screen(cfg) -> None:
     setup = check_setup(cfg)
 
     # Auto-trigger onboarding when the critical bits are missing.
-    if not setup["gemini"] or not setup["model"] or not setup["data"]:
+    if not setup["llm"] or not setup["model"] or not setup["data"]:
         _print_setup_status(setup)
         try:
             if Confirm.ask("\nRun setup wizard now?", default=True):
@@ -189,7 +241,7 @@ def show_launch_screen(cfg) -> None:
 
 def _render_main_menu(cfg, setup: dict[str, bool]) -> None:
     status_parts = []
-    for label, key in [("Gemini", "gemini"), ("Kalshi", "kalshi"),
+    for label, key in [("LLM", "llm"), ("Kalshi", "kalshi"),
                        ("Model", "model"), ("Data", "data")]:
         icon = "[green]✓[/green]" if setup[key] else "[red]✗[/red]"
         status_parts.append(f"{icon} {label}")
@@ -197,11 +249,14 @@ def _render_main_menu(cfg, setup: dict[str, bool]) -> None:
 
     n_decisions = _today_decisions(cfg)
     bal_line = _bankroll_line(cfg, setup)
+    active = _active_llm_label()
 
     body = (
         "[bold]Tennis-Edge[/bold] — Kalshi Tennis Trading Assistant\n\n"
         f"  [dim]Setup     [/dim] {status_line}\n"
     )
+    if active:
+        body += f"  [dim]Agent LLM [/dim] {active} (grounded)\n"
     if bal_line:
         body += f"  [dim]Bankroll  [/dim] {bal_line}\n"
     body += f"  [dim]Today     [/dim] {n_decisions} decisions logged"
@@ -218,7 +273,7 @@ def _render_main_menu(cfg, setup: dict[str, bool]) -> None:
 def _print_setup_status(setup: dict[str, bool]) -> None:
     console.print("[yellow]Setup incomplete:[/yellow]")
     labels = {
-        "gemini": "Gemini API key",
+        "llm":    "LLM API key (Gemini / OpenAI / Claude)",
         "kalshi": "Kalshi API key (optional for paper mode)",
         "model":  "Trained model artifact",
         "data":   "Player database populated",
@@ -444,12 +499,12 @@ def _show_status(cfg) -> None:
 
 def _settings_submenu(cfg) -> None:
     while True:
-        gem_display = _mask(os.environ.get("TENNIS_EDGE_GEMINI_KEY", ""))
+        llm_display = _llm_summary_for_settings()
         kal_display = _mask(cfg.kalshi.api_key_id)
 
         body = (
             "[bold]Settings[/bold]\n\n"
-            f"  [cyan][1][/cyan] Set/update Gemini API key   (current: {gem_display})\n"
+            f"  [cyan][1][/cyan] Set/update LLM API key      ({llm_display})\n"
             f"  [cyan][2][/cyan] Set/update Kalshi API key   (current: {kal_display})\n"
             "  [cyan][3][/cyan] Validate credentials        (real API calls)\n"
             "  [cyan][4][/cyan] View full config            (read-only)\n"
@@ -466,7 +521,7 @@ def _settings_submenu(cfg) -> None:
             return
 
         if choice == "1":
-            _set_gemini_key(cfg)
+            _llm_provider_submenu(cfg)
         elif choice == "2":
             _set_kalshi_key(cfg)
         elif choice == "3":
@@ -477,13 +532,78 @@ def _settings_submenu(cfg) -> None:
             return
 
 
-def _set_gemini_key(cfg) -> None:
-    console.print(Panel(
-        "[bold]Gemini API key[/bold]\n\n"
-        "Get a key at [cyan]https://aistudio.google.com/apikey[/cyan]\n"
-        "Free tier covers small testing; live runs ~$10/month.",
-        expand=False,
-    ))
+def _llm_summary_for_settings() -> str:
+    """One-liner for the Settings menu showing which providers are
+    configured. e.g. 'Gemini ✓, OpenAI ○, Claude ○'."""
+    parts = []
+    for provider in LLM_PROVIDERS.values():
+        configured = bool(os.environ.get(provider["env_var"]))
+        icon = "[green]✓[/green]" if configured else "[dim]○[/dim]"
+        parts.append(f"{provider['label']} {icon}")
+    return ", ".join(parts)
+
+
+def _llm_provider_submenu(cfg) -> None:
+    """Pick a provider, then configure its key. Today only Gemini is
+    actually used by the agent's grounded path; OpenAI and Claude
+    keys are saved for the upcoming multi-provider PR.
+    """
+    while True:
+        body = ["[bold]LLM provider[/bold]\n"]
+        body.append("Select which provider to configure:\n")
+        for i, (key, p) in enumerate(LLM_PROVIDERS.items(), start=1):
+            current = _mask(os.environ.get(p["env_var"], ""))
+            tag = (
+                "[green](used by agent)[/green]"
+                if p["status"] == "active"
+                else "[dim](key saved for future use)[/dim]"
+            )
+            body.append(
+                f"  [cyan][{i}][/cyan] {p['label']:8s} {tag}\n"
+                f"      key: {current}"
+            )
+        back_idx = len(LLM_PROVIDERS) + 1
+        body.append(f"\n  [cyan][{back_idx}][/cyan] Back")
+        console.print(Panel("\n".join(body), expand=False))
+
+        choices = [str(i) for i in range(1, back_idx + 1)]
+        try:
+            choice = Prompt.ask("Select", choices=choices, default=str(back_idx))
+        except KeyboardInterrupt:
+            return
+
+        idx = int(choice)
+        if idx == back_idx:
+            return
+
+        provider_key = list(LLM_PROVIDERS.keys())[idx - 1]
+        _set_llm_key_for(cfg, provider_key)
+
+
+def _set_llm_key_for(cfg, provider_key: str) -> None:
+    """Walk the user through obtaining an API key for the chosen
+    provider and save it to .env. Same shape for every provider so
+    adding more is one entry in LLM_PROVIDERS away.
+    """
+    p = LLM_PROVIDERS[provider_key]
+
+    panel_body = (
+        f"[bold]{p['label']} API key[/bold]\n\n"
+        f"Get a key at [cyan]{p['url']}[/cyan]\n"
+        f"Vendor: {p['vendor']}\n"
+    )
+    if p["status"] == "active":
+        panel_body += (
+            "\n[green]This provider is wired into the agent today.[/green]"
+        )
+    else:
+        panel_body += (
+            "\n[yellow]Key will be saved to .env. Note: the agent's "
+            "grounded path currently uses Gemini; multi-provider support "
+            "is on the roadmap.[/yellow]"
+        )
+    console.print(Panel(panel_body, expand=False))
+
     try:
         key = Prompt.ask("Paste key (input visible)", default="").strip()
     except KeyboardInterrupt:
@@ -491,11 +611,13 @@ def _set_gemini_key(cfg) -> None:
     if not key:
         console.print("[yellow]Skipped.[/yellow]")
         return
-    if not key.startswith("AIza"):
+
+    expected_prefix = p["prefix"]
+    if not key.startswith(expected_prefix):
         try:
             ok = Confirm.ask(
-                "[yellow]That doesn't look like a Gemini key (should start with "
-                "'AIza'). Save anyway?[/yellow]",
+                f"[yellow]That doesn't look like a {p['label']} key "
+                f"(should start with '{expected_prefix}'). Save anyway?[/yellow]",
                 default=False,
             )
         except KeyboardInterrupt:
@@ -504,9 +626,9 @@ def _set_gemini_key(cfg) -> None:
             return
 
     env_path = Path(cfg.project_root) / ".env"
-    _update_dotenv(env_path, "TENNIS_EDGE_GEMINI_KEY", key)
-    os.environ["TENNIS_EDGE_GEMINI_KEY"] = key
-    console.print(f"[green]✓ Saved to {env_path}[/green]")
+    _update_dotenv(env_path, p["env_var"], key)
+    os.environ[p["env_var"]] = key
+    console.print(f"[green]✓ Saved to {env_path} as {p['env_var']}[/green]")
 
 
 def _set_kalshi_key(cfg) -> None:
@@ -562,10 +684,10 @@ def _set_kalshi_key(cfg) -> None:
 def _validate_credentials(cfg) -> None:
     console.print("\n[bold]Validating credentials...[/bold]\n")
 
-    # --- Gemini ---
+    # --- Gemini (wired into agent today) ---
     gem_key = os.environ.get("TENNIS_EDGE_GEMINI_KEY")
     if not gem_key:
-        console.print("  [red]✗ Gemini: not set[/red]")
+        console.print("  [yellow]○ Gemini: not set[/yellow]")
     else:
         try:
             from google import genai
@@ -574,6 +696,42 @@ def _validate_credentials(cfg) -> None:
             console.print(f"  [green]✓ Gemini: {count} models accessible[/green]")
         except Exception as e:
             console.print(f"  [red]✗ Gemini: {e}[/red]")
+
+    # --- OpenAI (key saved; provider not wired yet) ---
+    oai_key = os.environ.get("TENNIS_EDGE_OPENAI_KEY")
+    if not oai_key:
+        console.print("  [dim]○ OpenAI: not set[/dim]")
+    else:
+        # Cheapest validation: format check only. We do not import
+        # the SDK here because openai is not a project dependency
+        # (only google-genai is). Multi-provider PR will swap this
+        # for a real models.list() call.
+        if oai_key.startswith("sk-"):
+            console.print(
+                "  [green]✓ OpenAI: key saved (format OK; "
+                "provider wiring pending)[/green]"
+            )
+        else:
+            console.print(
+                "  [yellow]⚠ OpenAI: key saved but doesn't look like "
+                "an OpenAI key (should start with 'sk-')[/yellow]"
+            )
+
+    # --- Anthropic / Claude (key saved; provider not wired yet) ---
+    ant_key = os.environ.get("TENNIS_EDGE_ANTHROPIC_KEY")
+    if not ant_key:
+        console.print("  [dim]○ Claude: not set[/dim]")
+    else:
+        if ant_key.startswith("sk-ant-"):
+            console.print(
+                "  [green]✓ Claude: key saved (format OK; "
+                "provider wiring pending)[/green]"
+            )
+        else:
+            console.print(
+                "  [yellow]⚠ Claude: key saved but doesn't look like "
+                "an Anthropic key (should start with 'sk-ant-')[/yellow]"
+            )
 
     # --- Kalshi ---
     if not _kalshi_auth_present(cfg):
@@ -666,12 +824,21 @@ def run_onboarding(cfg) -> None:
             "  [cyan]tennis-edge train[/cyan]     [dim]# trains logistic model[/dim]\n",
         )
 
-    # Gemini is required for the agent path. Skip prompt only if already set.
-    if not setup["gemini"]:
-        console.print("\n═════ Step 1/2: Gemini API key (required for agent) ═════\n")
-        _set_gemini_key(cfg)
+    # LLM key is required for the agent path. Skip prompt only if
+    # at least one provider is already configured.
+    if not setup["llm"]:
+        console.print(
+            "\n═════ Step 1/2: LLM API key (required for agent) ═════\n"
+        )
+        console.print(
+            "The agent's grounded research uses an LLM with web access. "
+            "Currently the agent runs Gemini; OpenAI and Claude support "
+            "is on the roadmap (you can save those keys now too).\n"
+        )
+        _llm_provider_submenu(cfg)
     else:
-        console.print("\n[green]✓ Gemini key already configured.[/green]")
+        active = _active_llm_label() or "an LLM provider"
+        console.print(f"\n[green]✓ {active} key already configured.[/green]")
 
     # Kalshi optional — paper mode does not require it.
     if not setup["kalshi"]:

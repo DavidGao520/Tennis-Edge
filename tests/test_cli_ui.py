@@ -18,7 +18,10 @@ from pathlib import Path
 import pytest
 
 from tennis_edge.cli_ui import (
+    LLM_PROVIDERS,
+    _active_llm_label,
     _kalshi_auth_present,
+    _llm_present,
     _mask,
     _model_present,
     _player_count,
@@ -236,21 +239,40 @@ def test_model_present_when_artifact_exists(tmp_path: Path):
 
 
 def test_check_setup_all_false_in_fresh_project(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("TENNIS_EDGE_GEMINI_KEY", raising=False)
+    for p in LLM_PROVIDERS.values():
+        monkeypatch.delenv(p["env_var"], raising=False)
     cfg = _AppCfg(project_root=str(tmp_path))
     setup = check_setup(cfg)
-    assert setup == {"gemini": False, "kalshi": False, "model": False, "data": False}
+    assert setup == {"llm": False, "kalshi": False, "model": False, "data": False}
 
 
-def test_check_setup_gemini_true_when_env_set(tmp_path: Path, monkeypatch):
+def test_check_setup_llm_true_when_gemini_set(tmp_path: Path, monkeypatch):
+    for p in LLM_PROVIDERS.values():
+        monkeypatch.delenv(p["env_var"], raising=False)
     monkeypatch.setenv("TENNIS_EDGE_GEMINI_KEY", "AIzaTestKey")
     cfg = _AppCfg(project_root=str(tmp_path))
     setup = check_setup(cfg)
-    assert setup["gemini"] is True
-    # Other flags still false because the rest of the project is empty.
-    assert setup["kalshi"] is False
-    assert setup["model"] is False
-    assert setup["data"] is False
+    assert setup["llm"] is True
+
+
+def test_check_setup_llm_true_when_only_openai_set(tmp_path: Path, monkeypatch):
+    """LLM badge should green up if any supported provider is set,
+    not just Gemini."""
+    for p in LLM_PROVIDERS.values():
+        monkeypatch.delenv(p["env_var"], raising=False)
+    monkeypatch.setenv("TENNIS_EDGE_OPENAI_KEY", "sk-test-openai")
+    cfg = _AppCfg(project_root=str(tmp_path))
+    setup = check_setup(cfg)
+    assert setup["llm"] is True
+
+
+def test_check_setup_llm_true_when_only_claude_set(tmp_path: Path, monkeypatch):
+    for p in LLM_PROVIDERS.values():
+        monkeypatch.delenv(p["env_var"], raising=False)
+    monkeypatch.setenv("TENNIS_EDGE_ANTHROPIC_KEY", "sk-ant-test")
+    cfg = _AppCfg(project_root=str(tmp_path))
+    setup = check_setup(cfg)
+    assert setup["llm"] is True
 
 
 def test_check_setup_all_true_when_everything_set(tmp_path: Path, monkeypatch):
@@ -281,4 +303,67 @@ def test_check_setup_all_true_when_everything_set(tmp_path: Path, monkeypatch):
         kalshi=_KalshiCfg(api_key_id="abc", private_key_path="config/kalshi.pem"),
     )
     setup = check_setup(cfg)
-    assert setup == {"gemini": True, "kalshi": True, "model": True, "data": True}
+    assert setup == {"llm": True, "kalshi": True, "model": True, "data": True}
+
+
+# ---------------------------------------------------------------------------
+# LLM provider registry
+# ---------------------------------------------------------------------------
+
+
+def test_llm_providers_registry_has_all_three():
+    """Three providers exposed: gemini (active), openai + anthropic
+    (key-only). If a future PR adds a fourth, this test should
+    update — but the contract here is that all three current
+    providers exist and have the required metadata."""
+    assert set(LLM_PROVIDERS.keys()) == {"gemini", "openai", "anthropic"}
+    for p in LLM_PROVIDERS.values():
+        assert "label" in p
+        assert "env_var" in p
+        assert "url" in p
+        assert "prefix" in p
+        assert "status" in p
+        assert p["status"] in ("active", "saved")
+
+
+def test_only_gemini_is_active_today():
+    """The agent's grounded path is wired to Gemini today.
+    OpenAI/Claude provider classes land in a future PR. This test
+    locks the current state — change the assertion when adding new
+    active providers."""
+    actives = [
+        k for k, p in LLM_PROVIDERS.items() if p["status"] == "active"
+    ]
+    assert actives == ["gemini"]
+
+
+def test_llm_present_false_when_no_keys(monkeypatch):
+    for p in LLM_PROVIDERS.values():
+        monkeypatch.delenv(p["env_var"], raising=False)
+    assert _llm_present() is False
+
+
+def test_llm_present_true_for_each_provider(monkeypatch):
+    for provider_key, p in LLM_PROVIDERS.items():
+        # Clear all, then set just this one.
+        for q in LLM_PROVIDERS.values():
+            monkeypatch.delenv(q["env_var"], raising=False)
+        monkeypatch.setenv(p["env_var"], "test-key")
+        assert _llm_present() is True, f"{provider_key} did not register"
+
+
+def test_active_llm_label_returns_active_provider(monkeypatch):
+    for p in LLM_PROVIDERS.values():
+        monkeypatch.delenv(p["env_var"], raising=False)
+    monkeypatch.setenv("TENNIS_EDGE_GEMINI_KEY", "AIzaTest")
+    assert _active_llm_label() == "Gemini"
+
+
+def test_active_llm_label_none_when_only_inactive_providers(monkeypatch):
+    """If the user configures OpenAI/Claude but not Gemini, the
+    'active' provider count is zero — agent has no LLM to use."""
+    for p in LLM_PROVIDERS.values():
+        monkeypatch.delenv(p["env_var"], raising=False)
+    monkeypatch.setenv("TENNIS_EDGE_OPENAI_KEY", "sk-test")
+    monkeypatch.setenv("TENNIS_EDGE_ANTHROPIC_KEY", "sk-ant-test")
+    assert _active_llm_label() is None
