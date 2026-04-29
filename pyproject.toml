@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov", "pytest-asyncio", "ruff", "mypy", "respx"]
 boost = ["xgboost>=2.0", "lightgbm>=4.0"]
+agent = ["google-genai>=1.70"]  # Phase 2 agent LLM (Gemini 3.x)
 
 [project.scripts]
 tennis-edge = "tennis_edge.cli:main"
@@ -42,3 +43,8 @@ line-length = 100
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "eval: requires real LLM API calls; run with `pytest -m eval`. Costs money and is slow. Excluded from default `pytest tests/`.",
+]
+# Default test runs skip eval. Run evals explicitly: pytest -m eval
+addopts = "-m 'not eval'"

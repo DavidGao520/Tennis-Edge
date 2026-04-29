@@ -46,6 +46,17 @@ class OrderRequest(BaseModel):
     yes_price: int | None = None  # cents, for limit orders
     expiration_ts: int | None = None
 
+    # Phase 3 v2: client-side idempotency key. Kalshi treats two
+    # POSTs with the same `client_order_id` from the same account as
+    # the same order, so a network-timeout retry will not double the
+    # position. AgentLoop sets this to the decision_id (UUID4) so
+    # one decision = at most one fill regardless of how many physical
+    # POSTs hit the server.
+    #
+    # Paper engine accepts this field but does not act on it — paper
+    # has no network to be flaky over.
+    client_order_id: str | None = None
+
 
 class OrderResponse(BaseModel):
     order_id: str = ""

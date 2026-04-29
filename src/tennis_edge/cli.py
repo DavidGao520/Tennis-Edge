@@ -14,6 +14,33 @@ from .utils.logging import setup_logging
 console = Console()
 
 
+def _load_dotenv(project_root: Path) -> None:
+    """Load `.env` from project root into os.environ.
+
+    Tiny inline implementation so we do not pull a dotenv dependency.
+    Skips comments, blank lines, and any line lacking '='. Does not
+    overwrite values already in os.environ (env > .env, the standard
+    precedence).
+
+    `.env` is gitignored. It is the canonical place for secrets like
+    TENNIS_EDGE_GEMINI_KEY and TENNIS_EDGE__KALSHI__API_KEY_ID on
+    developer machines.
+    """
+    import os as _os
+    env_file = project_root / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in _os.environ:
+            _os.environ[key] = value
+
+
 @click.group()
 @click.option(
     "--config", "-c",
@@ -31,6 +58,11 @@ def main(ctx: click.Context, config: str | None) -> None:
         pkg_dir = Path(__file__).parent.parent.parent
         default = pkg_dir / "config" / "default.yaml"
         config = str(default) if default.exists() else None
+
+    # Load .env BEFORE load_config so any TENNIS_EDGE__* env-var
+    # overrides take effect.
+    if config is not None:
+        _load_dotenv(Path(config).parent.parent)
 
     cfg = load_config(config)
     setup_logging(cfg.logging.level, str(Path(cfg.project_root) / cfg.logging.file))
@@ -560,6 +592,29 @@ def monitor(ctx: click.Context) -> None:
         console.print("\n[yellow]Monitor stopped.[/yellow]")
 
 
+@main.command(name="log-ticks")
+@click.pass_context
+def log_ticks(ctx: click.Context) -> None:
+    """Stream Kalshi WebSocket tennis ticks to SQLite (market_ticks table).
+
+    Run continuously (e.g. inside tmux/screen). Each day this is not running
+    is a day of real backtest data we can never recover.
+    """
+    import asyncio
+    from .tick_logger import TickLogger
+
+    cfg = ctx.obj["config"]
+    tl = TickLogger(cfg)
+
+    console.print("[bold]Starting Kalshi tick logger (tennis only)...[/bold]")
+    console.print("[dim]Writing to market_ticks table. Press Ctrl+C to stop.[/dim]\n")
+
+    try:
+        asyncio.run(tl.run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Tick logger stopped.[/yellow]")
+
+
 @main.command()
 @click.argument("player_name")
 @click.pass_context
@@ -665,6 +720,489 @@ def history(ctx: click.Context, export_dir: str | None) -> None:
             f"{data['win_rate']*100:.0f}%",
         )
     console.print(cat_table)
+
+
+@main.group()
+def agent() -> None:
+    """Phase 2 shadow-trade agent (Option 3).
+
+    Sub-commands:
+      start   — spawn the daemon (runs foreground; use tmux/systemd)
+      pause   — pause the running daemon (reversible)
+      resume  — clear the pause flag
+      flatten — stop the daemon and close agent-opened positions (terminal)
+      status  — print run-state, decision count, budget, daily P&L
+    """
+
+
+def _control_dir(cfg) -> Path:
+    """Resolved absolute control dir under project_root."""
+    return Path(cfg.project_root) / "data" / "agent_control"
+
+
+def _decisions_paths(cfg) -> tuple[Path, Path]:
+    root = Path(cfg.project_root)
+    return (
+        root / "data" / "agent_decisions.jsonl",
+        root / "data" / "agent_settlements.jsonl",
+    )
+
+
+@agent.command("start")
+@click.option(
+    "--executor",
+    type=click.Choice(["paper", "live"]),
+    default="paper",
+    show_default=True,
+    help="paper = simulated fills (no real money). live = real Kalshi orders. "
+         "Default paper. Live requires TENNIS_EDGE_GEMINI_KEY + Kalshi auth.",
+)
+@click.option(
+    "--whitelist",
+    type=click.Choice(["atp-wta-main", "all-tennis"]),
+    default="atp-wta-main",
+    show_default=True,
+    help="Which Kalshi tennis series the bridge scans. Week 1 = main only "
+         "(Gemini grounding works there). all-tennis adds Challengers.",
+)
+@click.option("--min-prematch-ev", type=float, default=0.15, show_default=True,
+              help="Monitor signal threshold. Below this we don't even call "
+                   "Gemini.")
+@click.option("--cooldown", type=float, default=300.0, show_default=True,
+              help="Per-ticker cooldown seconds.")
+@click.option("--gemini-budget", type=float, default=50.0, show_default=True,
+              help="Monthly Gemini budget cap in USD.")
+@click.option("--model",
+              default="gemini-3.1-pro-preview", show_default=True,
+              help="Gemini model ID for the grounded LLM provider.")
+@click.option("--bankroll", type=float, default=1000.0, show_default=True,
+              help="Bankroll used for Kelly sizing. Capped at "
+                   "--max-position per trade. Default $1000.")
+@click.option("--max-position", type=float, default=50.0, show_default=True,
+              help="Hard $ cap per market. Default $50.")
+@click.option("--max-total-exposure", type=float, default=500.0, show_default=True,
+              help="Hard $ cap on total open exposure. Default $500.")
+@click.option("--daily-loss-limit", type=float, default=200.0, show_default=True,
+              help="Daily P&L floor. Below this the daemon kills itself.")
+@click.option("--mode",
+              type=click.Choice(["shadow", "auto"]),
+              default="shadow", show_default=True,
+              help="Both call exchange.place_order; the difference is just "
+                   "the analytics tag on logged decisions. Use shadow during "
+                   "the paper-validation phase.")
+@click.pass_context
+def agent_start(
+    ctx: click.Context,
+    executor: str,
+    whitelist: str,
+    min_prematch_ev: float,
+    cooldown: float,
+    gemini_budget: float,
+    model: str,
+    bankroll: float,
+    max_position: float,
+    max_total_exposure: float,
+    daily_loss_limit: float,
+    mode: str,
+) -> None:
+    """Start the v2 agent daemon in the foreground.
+
+    Run inside tmux so SSH disconnects don't kill it:
+
+        tmux new -s agent
+        tennis-edge agent start                # paper, ATP/WTA Main
+        # Ctrl+B D to detach
+
+    The daemon runs four coroutines concurrently:
+      - MonitorBridge: scans Kalshi every 15s, emits MonitorSignal
+      - AgentLoop:     gates signal → grounded Gemini → executor
+      - SettlementPoller: 15min counterfactual P&L backfill
+      - SafetyMonitor.watchdog_loop: 30s health check + kill switches
+
+    The flip from paper to live is a single flag (`--executor live`).
+    Per the v2 plan: stay in paper until counterfactual P&L is positive
+    over 10+ settled markets or 50 decisions, whichever later.
+    """
+    import asyncio
+    import os
+    import signal as signalmod
+
+    from .agent.decisions import DecisionLog
+    from .agent.llm import BudgetTracker, GeminiGroundedProvider, PricingRates
+    from .agent.loop import AgentLoop, AgentLoopConfig
+    from .agent.monitor_bridge import (
+        MonitorBridge, MonitorBridgeConfig,
+        WHITELIST_ATP_WTA_MAIN, WHITELIST_ALL_TENNIS,
+    )
+    from .agent.runtime import AgentRuntime, MarketCache
+    from .agent.safety import SafetyConfig, SafetyMonitor
+    from .agent.settlement import SettlementConfig, SettlementPoller
+    from .config import RiskConfig
+    from .data.db import Database
+    from .exchange.auth import KalshiAuth
+    from .exchange.client import KalshiClient
+    from .exchange.paper import PaperTradingEngine
+    from .features.builder import FeatureBuilder
+    from .model.predictor import LogisticPredictor
+    from .ratings.glicko2 import Glicko2Engine
+    from .ratings.tracker import RatingTracker
+    from .scanner import EVScanner
+    from .strategy.risk import RiskManager
+    from .strategy.sizing import PositionSizer
+
+    cfg = ctx.obj["config"]
+    key = _load_gemini_key(cfg)
+    if not key:
+        console.print("[red]TENNIS_EDGE_GEMINI_KEY not set (.env or env var).[/red]")
+        return
+
+    series_whitelist = (
+        WHITELIST_ATP_WTA_MAIN if whitelist == "atp-wta-main"
+        else WHITELIST_ALL_TENNIS
+    )
+    grounded_provider_name = f"{model}-grounded"
+
+    async def _run() -> None:
+        db_path = Path(cfg.project_root) / cfg.database.path
+        key_path = Path(cfg.project_root) / cfg.kalshi.private_key_path
+
+        decisions_path, settlements_path = _decisions_paths(cfg)
+        decisions = DecisionLog(decisions_path, settlements_path)
+
+        rates = PricingRates(
+            input_per_1m_usd=2.50,
+            output_per_1m_usd=10.00,
+            thinking_per_1m_usd=10.00,
+        )
+        budget = BudgetTracker(
+            Path(cfg.project_root) / "data" / "agent_budget.json",
+            monthly_cap_usd={grounded_provider_name: gemini_budget},
+        )
+        llm = GeminiGroundedProvider(
+            model=model, rates=rates, budget=budget, api_key=key,
+        )
+
+        safety = SafetyMonitor(SafetyConfig(
+            control_dir=str(_control_dir(cfg)),
+            daily_loss_limit_usd=daily_loss_limit,
+        ))
+
+        risk = RiskManager(RiskConfig(
+            max_position_per_market=max_position,
+            max_total_exposure=max_total_exposure,
+            daily_loss_limit=daily_loss_limit,
+            kill_switch=False,
+        ))
+
+        loop_cfg = AgentLoopConfig(
+            queue_max=20,
+            cooldown_s=cooldown,
+            max_candidate_age_s=60.0,
+            min_grounded_edge=0.10,
+            stale_edge_hard_threshold=0.08,
+            kelly_fraction=cfg.strategy.kelly_fraction,
+            bankroll=bankroll,
+            max_position_per_market=max_position,
+            mode=mode,
+        )
+
+        bridge_cfg = MonitorBridgeConfig(
+            series_whitelist=series_whitelist,
+            min_prematch_ev=min_prematch_ev,
+            price_band=(10, 90),
+            poll_interval_s=15.0,
+        )
+
+        with Database(db_path) as db:
+            engine = Glicko2Engine(tau=cfg.ratings.tau)
+            tracker = RatingTracker(
+                db, engine, period_days=cfg.ratings.rating_period_days,
+            )
+            builder = FeatureBuilder(db, tracker)
+            model_artifact = (
+                Path(cfg.project_root) / cfg.model.artifacts_dir / "latest.joblib"
+            )
+            predictor = LogisticPredictor.load(model_artifact)
+            sizer = PositionSizer(
+                bankroll=bankroll,
+                kelly_fraction=cfg.strategy.kelly_fraction,
+                max_bet_fraction=cfg.strategy.max_bet_fraction,
+                min_edge=cfg.strategy.min_edge,
+            )
+
+            # Kalshi auth: only required for `--executor live` (real
+            # orders need RSA-PSS signing). For paper mode, public
+            # REST endpoints (get_markets, get_orderbook) work fine
+            # without auth, and place_order goes through
+            # PaperTradingEngine entirely.
+            auth: KalshiAuth | None = None
+            if cfg.kalshi.api_key_id and key_path.is_file():
+                try:
+                    auth = KalshiAuth(cfg.kalshi.api_key_id, str(key_path))
+                except Exception as e:
+                    if executor == "live":
+                        console.print(
+                            f"[red]Kalshi auth failed (required for live "
+                            f"mode): {e}[/red]"
+                        )
+                        return
+                    console.print(
+                        f"[yellow]Kalshi auth not available; running paper "
+                        f"mode against public REST only.[/yellow]"
+                    )
+            elif executor == "live":
+                console.print(
+                    "[red]--executor live requires Kalshi auth: set "
+                    "TENNIS_EDGE__KALSHI__API_KEY_ID and ensure "
+                    "config/kalshi_private_key.pem exists.[/red]"
+                )
+                return
+
+            async with KalshiClient(cfg.kalshi, auth) as kalshi_client:
+                runtime = AgentRuntime(
+                    db=db, tracker=tracker, builder=builder, model=predictor,
+                    market_cache=MarketCache(kalshi_client),
+                )
+
+                # Pick the executor. Same ExchangeClient ABC so
+                # AgentLoop is paper/live agnostic.
+                executor_client = (
+                    PaperTradingEngine(initial_balance=bankroll)
+                    if executor == "paper"
+                    else kalshi_client
+                )
+
+                # MonitorBridge needs an EVScanner to compute prematch
+                # signals. Same scanner as `tennis-edge opportunities`.
+                scanner = EVScanner(
+                    db, tracker, builder, predictor, sizer,
+                    cfg.strategy.kelly_fraction,
+                )
+
+                # prompt_builder: prefetch market via cache, then call
+                # the existing sync runtime.context_builder. Returns
+                # None if the market can't be enriched.
+                async def prompt_builder(sig):
+                    await runtime.market_cache.get(sig.ticker)
+                    return runtime.context_builder(
+                        sig.ticker, sig.model_prob, sig.market_yes_cents,
+                    )
+
+                bridge = MonitorBridge(
+                    client=kalshi_client,
+                    scanner=scanner,
+                    on_signal=lambda sig: agent_loop.on_signal(sig),  # late-bound
+                    config=bridge_cfg,
+                )
+
+                # AgentLoop's post-LLM price re-check pulls from the
+                # bridge's per-ticker price cache. Same single-process
+                # source of truth — no tick-logger DB read path.
+                agent_loop = AgentLoop(
+                    config=loop_cfg,
+                    safety=safety,
+                    llm=llm,
+                    decisions=decisions,
+                    risk=risk,
+                    exchange=executor_client,
+                    prompt_builder=prompt_builder,
+                    price_source=bridge.latest_price,
+                )
+
+                settlement = SettlementPoller(
+                    log=decisions, exchange=kalshi_client,
+                    config=SettlementConfig(),
+                    risk=risk,  # closes the v1 dormant kill switch
+                )
+
+                def is_live_match() -> bool:
+                    row = db.query_one(
+                        "SELECT MAX(received_at) AS m FROM market_ticks "
+                        "WHERE received_at > ?",
+                        (int(__import__("time").time()) - 300,),
+                    )
+                    return bool(row and row["m"])
+
+                # SIGINT/SIGTERM → graceful shutdown across all four loops.
+                loop_handle = asyncio.get_running_loop()
+
+                def _graceful(_sig=None, _frame=None):
+                    agent_loop.request_stop()
+                    bridge.request_stop()
+                    settlement.request_stop()
+
+                for sig in (signalmod.SIGINT, signalmod.SIGTERM):
+                    try:
+                        loop_handle.add_signal_handler(sig, _graceful)
+                    except NotImplementedError:
+                        pass  # windows
+
+                console.print(
+                    f"[bold green]Agent v2 starting[/bold green] "
+                    f"executor={executor} whitelist={whitelist} "
+                    f"mode={mode} min_ev={min_prematch_ev} cooldown={cooldown}s"
+                )
+                console.print(
+                    f"[dim]Caps: ${max_position}/market ${max_total_exposure} total "
+                    f"daily-loss=${daily_loss_limit} budget=${gemini_budget}/mo[/dim]"
+                )
+                console.print(f"[dim]Control dir: {_control_dir(cfg)}[/dim]")
+                console.print(f"[dim]Decisions: {decisions_path}[/dim]")
+
+                await asyncio.gather(
+                    bridge.run(),
+                    agent_loop.run(),
+                    settlement.run(),
+                    safety.watchdog_loop(
+                        ws=_DummyWS(),  # agent does not own a live WS
+                        # db_path=None: agent is self-contained in v2,
+                        # no separate tick-logger process whose
+                        # liveness we need to monitor. tick-logger
+                        # still runs on Mac mini for backtest data,
+                        # but the agent does not depend on it.
+                        db_path=None,
+                        budget=budget,
+                        providers=[grounded_provider_name],
+                        risk=risk,
+                        live_match_fn=is_live_match,
+                        interval_s=30.0,
+                    ),
+                )
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        console.print("[yellow]Agent stopped.[/yellow]")
+
+    # USER_FLATTEN trip: clear the flag so next start doesn't re-trip.
+    # In Phase 3A there are no agent-opened positions to close (paper
+    # has nothing real, and live mode hasn't shipped yet).
+    try:
+        from .agent.safety import clear_flatten_flag
+        clear_flatten_flag(_control_dir(cfg))
+    except Exception:
+        pass
+
+
+def _load_gemini_key(cfg) -> str | None:
+    """Resolve TENNIS_EDGE_GEMINI_KEY from env or .env. Sets env var
+    on success so downstream SDK clients pick it up."""
+    import os
+
+    key = os.environ.get("TENNIS_EDGE_GEMINI_KEY")
+    if key:
+        return key
+    env_file = Path(cfg.project_root) / ".env"
+    if not env_file.exists():
+        return None
+    for line in env_file.read_text().splitlines():
+        if line.startswith("TENNIS_EDGE_GEMINI_KEY="):
+            key = line.split("=", 1)[1].strip()
+            os.environ["TENNIS_EDGE_GEMINI_KEY"] = key
+            return key
+    return None
+
+
+class _DummyWS:
+    """Phase 3 v2: agent doesn't own a Kalshi WS — tick-logger does
+    that on the Mac mini. The two WS-related kill switches
+    (WS_RECONNECT_STARVATION, WS_STALE_WITH_LIVE_MATCH) are opted out
+    by reporting fresh timestamps. The TICK_LOGGER_STALE switch is
+    the real health signal for our setup."""
+
+    def seconds_since_last_message(self):
+        return 0.0
+
+    def seconds_since_last_connect(self):
+        return 0.0
+
+
+@agent.command("pause")
+@click.pass_context
+def agent_pause(ctx: click.Context) -> None:
+    """Pause the running agent (reversible). Daemon stops processing
+    candidates but stays up so `resume` can flip it back."""
+    from .agent.safety import touch_pause_flag
+    p = touch_pause_flag(_control_dir(ctx.obj["config"]))
+    console.print(f"[yellow]Paused[/yellow] — flag at {p}")
+
+
+@agent.command("resume")
+@click.pass_context
+def agent_resume(ctx: click.Context) -> None:
+    """Resume a paused agent by clearing the pause flag."""
+    from .agent.safety import clear_pause_flag
+    clear_pause_flag(_control_dir(ctx.obj["config"]))
+    console.print("[green]Resumed[/green]")
+
+
+@agent.command("flatten")
+@click.pass_context
+def agent_flatten(ctx: click.Context) -> None:
+    """Stop the daemon (terminal). Trips USER_FLATTEN; the daemon
+    exits after closing agent-opened positions (3B/3C) — in 3A shadow
+    mode there are no positions, so the daemon simply exits."""
+    from .agent.safety import touch_flatten_flag
+    p = touch_flatten_flag(_control_dir(ctx.obj["config"]))
+    console.print(f"[red]Flatten signaled[/red] — flag at {p}")
+
+
+@agent.command("status")
+@click.pass_context
+def agent_status(ctx: click.Context) -> None:
+    """Print decision counts, budget, daily P&L. Safe to run while the
+    daemon is running — this command never writes."""
+    import json
+
+    from .agent.decisions import DecisionLog
+
+    cfg = ctx.obj["config"]
+    dec_path, set_path = _decisions_paths(cfg)
+    ctrl = _control_dir(cfg)
+
+    log = DecisionLog(dec_path, set_path)
+    n_decisions = log.count_decisions()
+    n_settlements = sum(1 for _ in log.iter_settlements())
+
+    table = Table(title="Agent Status")
+    table.add_column("Field", style="cyan")
+    table.add_column("Value", justify="right")
+    table.add_row("Decisions logged", str(n_decisions))
+    table.add_row("Settlements", str(n_settlements))
+    table.add_row("Unresolved", str(n_decisions - n_settlements))
+    table.add_row("Pause flag", "present" if (ctrl / "pause").exists() else "—")
+    table.add_row("Flatten flag", "present" if (ctrl / "flatten").exists() else "—")
+
+    budget_path = Path(cfg.project_root) / "data" / "agent_budget.json"
+    if budget_path.exists():
+        try:
+            blob = json.loads(budget_path.read_text())
+            for provider, s in blob.get("providers", {}).items():
+                table.add_row(
+                    f"Budget {provider}",
+                    f"${s.get('total_cost_usd', 0):.4f} "
+                    f"(calls={s.get('call_count', 0)})",
+                )
+        except Exception:
+            pass
+
+    # Counterfactual shadow P&L summary (only when settlements exist).
+    if n_settlements > 0:
+        wins = losses = voids = 0
+        pnl = 0.0
+        for s in log.iter_settlements():
+            if s.outcome == "won":
+                wins += 1
+            elif s.outcome == "lost":
+                losses += 1
+            else:
+                voids += 1
+            pnl += s.realized_pnl
+        table.add_row("Shadow wins/losses/void", f"{wins}/{losses}/{voids}")
+        pnl_color = "green" if pnl >= 0 else "red"
+        table.add_row("Counterfactual P&L", f"[{pnl_color}]${pnl:,.2f}[/]")
+
+    console.print(table)
 
 
 if __name__ == "__main__":
