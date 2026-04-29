@@ -20,6 +20,7 @@ import pytest
 from tennis_edge.cli_ui import (
     LLM_PROVIDERS,
     _active_llm_label,
+    _has_tmux,
     _kalshi_auth_present,
     _llm_present,
     _mask,
@@ -367,3 +368,23 @@ def test_active_llm_label_none_when_only_inactive_providers(monkeypatch):
     monkeypatch.setenv("TENNIS_EDGE_OPENAI_KEY", "sk-test")
     monkeypatch.setenv("TENNIS_EDGE_ANTHROPIC_KEY", "sk-ant-test")
     assert _active_llm_label() is None
+
+
+# ---------------------------------------------------------------------------
+# tmux detection (used to gate the "Show start command" instructions)
+# ---------------------------------------------------------------------------
+
+
+def test_has_tmux_returns_bool():
+    """Smoke. Result depends on the host so we just assert the
+    return type is bool. The behavior is exercised end-to-end in
+    `_print_agent_start_command` via the host's PATH."""
+    assert isinstance(_has_tmux(), bool)
+
+
+def test_has_tmux_false_when_path_empty(monkeypatch):
+    """With empty PATH, shutil.which finds nothing, so _has_tmux
+    must be False. Locks the negative branch that sends the user
+    to `brew install tmux` or foreground execution."""
+    monkeypatch.setenv("PATH", "")
+    assert _has_tmux() is False
