@@ -255,6 +255,65 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Multi-Provider LLM UI (Gemini / OpenAI / Claude)
+
+Demo prep feedback: "the status badge says 'Gemini' but we should support multiple LLM providers; let users pick when onboarding."
+
+**Honest scope split**:
+- ✅ **UI / onboarding for all three providers** (this commit)
+- ⏸️ **Actually USING OpenAI / Claude in the agent** — provider classes + grounding + eval suite per provider — deferred to a future PR. Each new provider is 6-8 hours done properly (different SDK, different grounding mechanism, different cost rate, eval cases). Faking provider support without the wiring would be misleading UX.
+
+**What changed**:
+
+`LLM_PROVIDERS` registry in `cli_ui.py` — single source of truth:
+```python
+{
+  "gemini":    {"label": "Gemini",  "url": "aistudio.google.com/apikey",
+                "env_var": "TENNIS_EDGE_GEMINI_KEY",
+                "prefix": "AIza", "status": "active"},
+  "openai":    {"label": "OpenAI",  "url": "platform.openai.com/api-keys",
+                "env_var": "TENNIS_EDGE_OPENAI_KEY",
+                "prefix": "sk-",    "status": "saved"},
+  "anthropic": {"label": "Claude",  "url": "console.anthropic.com/settings/keys",
+                "env_var": "TENNIS_EDGE_ANTHROPIC_KEY",
+                "prefix": "sk-ant-", "status": "saved"},
+}
+```
+
+Adding a new provider in the future = one entry in this dict. The Settings menu and validation paths iterate over it.
+
+**Status badge change**: `✓ Gemini` → `✓ LLM`. The launch-screen "Setup" line now shows whether ANY supported provider is configured. A new line `Agent LLM  Gemini (grounded)` appears below when an active provider is wired — sets clear expectations about what's used vs what's saved.
+
+**Settings menu redesign**:
+- "[1] Set/update LLM API key" → opens provider picker (Gemini / OpenAI / Claude / Back)
+- Each picker option shows the provider's current key (masked) and tag: "(used by agent)" or "(key saved for future use)"
+- Per-provider walkthrough: opens with the provider's URL, prompts for key, format-validates the prefix, saves to its env var
+
+**Validate Credentials**: now reports per-provider:
+- Gemini: real `genai.list_models()` call (proves auth works)
+- OpenAI / Claude: format check only (saved-key state, no SDK dependency yet)
+
+**Onboarding wizard**: Step 1 ("LLM API key") now uses the provider picker instead of going straight to Gemini. Tells the user honestly that the agent currently runs Gemini while OpenAI/Claude support is on the roadmap.
+
+**Tests** (`tests/test_cli_ui.py`, +8 new = 29 total):
+- `LLM_PROVIDERS` registry has all three with required metadata
+- Only Gemini has `status="active"` today (locks the current state)
+- `_llm_present` true for each provider individually
+- `_active_llm_label` returns "Gemini" when set, None when only inactive providers configured
+- `check_setup` LLM badge greens up regardless of which provider's key is set
+
+**Migration note**: `setup["gemini"]` → `setup["llm"]`. Old name is gone; any caller would have errored loudly (caught one in `show_launch_screen` during smoke test).
+
+Full suite: **256 passed** (248 prior + 8 new). 5 deselected (eval).
+
+**Roadmap for actual multi-provider use** (not in this PR):
+1. `OpenAIProvider(LLMProvider)` — uses OpenAI Responses API + `tools` for grounding
+2. `AnthropicProvider(LLMProvider)` — uses `web_search` tool
+3. CLI flag `--llm-provider gemini|openai|anthropic` on `agent start`
+4. Per-provider rate constants
+5. Eval suite per provider
+6. A/B logged decisions with `llm_provider` field for cost/quality comparison
+
 ### April 19, 2026 — Interactive Launch Screen + Onboarding Wizard + Settings UI
 
 `tennis-edge` (no subcommand) now drops into a 5-option menu instead of dumping `--help`. Built for the demo — first thing teammates see is a polished dashboard, not raw Click output.
