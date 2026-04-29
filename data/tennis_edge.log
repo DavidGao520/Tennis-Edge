@@ -1,0 +1,94 @@
+2026-04-28 17:57:44 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_players.csv
+2026-04-28 17:57:45 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_players.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:45 [INFO       ] tennis_edge.data.ingest: Ingested 65989 players
+2026-04-28 17:57:45 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2000.csv
+2026-04-28 17:57:46 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2000.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:46 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2001.csv
+2026-04-28 17:57:46 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2001.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:46 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2002.csv
+2026-04-28 17:57:47 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2002.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:47 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2003.csv
+2026-04-28 17:57:47 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2003.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:47 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2004.csv
+2026-04-28 17:57:48 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2004.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:48 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2005.csv
+2026-04-28 17:57:48 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2005.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:48 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2006.csv
+2026-04-28 17:57:49 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2006.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:49 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2007.csv
+2026-04-28 17:57:49 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2007.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:49 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2008.csv
+2026-04-28 17:57:50 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2008.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:50 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2009.csv
+2026-04-28 17:57:50 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2009.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:50 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2010.csv
+2026-04-28 17:57:50 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2010.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:51 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2011.csv
+2026-04-28 17:57:51 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2011.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:51 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2012.csv
+2026-04-28 17:57:51 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2012.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:52 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2013.csv
+2026-04-28 17:57:52 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2013.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:52 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2014.csv
+2026-04-28 17:57:52 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2014.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:52 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2015.csv
+2026-04-28 17:57:53 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2015.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:53 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2016.csv
+2026-04-28 17:57:53 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2016.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:53 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2017.csv
+2026-04-28 17:57:54 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2017.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:54 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2018.csv
+2026-04-28 17:57:54 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2018.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:54 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2019.csv
+2026-04-28 17:57:55 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2019.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:55 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2020.csv
+2026-04-28 17:57:55 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2020.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:55 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2021.csv
+2026-04-28 17:57:55 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2021.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:56 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2022.csv
+2026-04-28 17:57:56 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2022.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:56 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv
+2026-04-28 17:57:56 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2023.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:57 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv
+2026-04-28 17:57:57 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2024.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:57 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2025.csv
+2026-04-28 17:57:57 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2025.csv "HTTP/1.1 404 Not Found"
+2026-04-28 17:57:57 [WARNING    ] tennis_edge.data.ingest: No match file for year 2025
+2026-04-28 17:57:57 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2026.csv
+2026-04-28 17:57:57 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2026.csv "HTTP/1.1 404 Not Found"
+2026-04-28 17:57:57 [WARNING    ] tennis_edge.data.ingest: No match file for year 2026
+2026-04-28 17:57:57 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_rankings_current.csv
+2026-04-28 17:57:58 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_rankings_current.csv "HTTP/1.1 200 OK"
+2026-04-28 17:57:59 [INFO       ] tennis_edge.data.ingest: Ingested 92341 rankings from atp_rankings_current.csv
+2026-04-28 17:57:59 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_rankings_10s.csv
+2026-04-28 17:58:02 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_rankings_10s.csv "HTTP/1.1 200 OK"
+2026-04-28 17:58:27 [INFO       ] tennis_edge.data.ingest: Ingested 915618 rankings from atp_rankings_10s.csv
+2026-04-28 17:58:27 [INFO       ] tennis_edge.data.ingest: Downloading https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_rankings_20s.csv
+2026-04-28 17:58:28 [INFO       ] httpx: HTTP Request: GET https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_rankings_20s.csv "HTTP/1.1 200 OK"
+2026-04-28 17:58:39 [INFO       ] tennis_edge.data.ingest: Ingested 332942 rankings from atp_rankings_20s.csv
+2026-04-28 18:00:23 [INFO       ] tennis_edge.ratings.tracker: Computed ratings across 293 periods for 2640 players
+2026-04-28 18:01:13 [INFO       ] tennis_edge.model.training: Building train set: 2005-01-01 to 2021-01-01
+2026-04-28 18:12:13 [INFO       ] tennis_edge.features.builder: Built dataset: 46790 samples, 36 features
+2026-04-28 18:12:13 [INFO       ] tennis_edge.model.training: Building val set: 2021-01-01 to 2024-01-01
+2026-04-28 18:13:35 [INFO       ] tennis_edge.features.builder: Built dataset: 8719 samples, 36 features
+2026-04-28 18:13:35 [INFO       ] tennis_edge.model.training: Building test set: 2024-01-01 to 2026-04-28
+2026-04-28 18:13:53 [INFO       ] tennis_edge.features.builder: Built dataset: 3076 samples, 36 features
+2026-04-28 18:13:53 [INFO       ] tennis_edge.model.training: Splits: train=46790, val=8719, test=3076
+2026-04-28 18:13:53 [INFO       ] tennis_edge.model.training: Tuning hyperparameters on validation set...
+2026-04-28 18:13:55 [INFO       ] tennis_edge.model.training: Best C=0.0100 (val Brier=0.2148)
+2026-04-28 18:13:55 [INFO       ] tennis_edge.model.training:   C=0.0010    acc=0.659  brier=0.2149  auc=0.657
+2026-04-28 18:13:55 [INFO       ] tennis_edge.model.training:   C=0.0100    acc=0.659  brier=0.2148  auc=0.658
+2026-04-28 18:13:55 [INFO       ] tennis_edge.model.training:   C=0.1000    acc=0.658  brier=0.2148  auc=0.658
+2026-04-28 18:13:55 [INFO       ] tennis_edge.model.training:   C=0.5000    acc=0.658  brier=0.2148  auc=0.658
+2026-04-28 18:13:55 [INFO       ] tennis_edge.model.training:   C=1.0000    acc=0.658  brier=0.2148  auc=0.658
+2026-04-28 18:13:55 [INFO       ] tennis_edge.model.training:   C=5.0000    acc=0.658  brier=0.2148  auc=0.658
+2026-04-28 18:13:55 [INFO       ] tennis_edge.model.training:   C=10.0000   acc=0.658  brier=0.2148  auc=0.658
+2026-04-28 18:13:55 [INFO       ] tennis_edge.model.training: Running walk-forward cross-validation...
+2026-04-28 18:13:55 [INFO       ] tennis_edge.model.training:   Fold 1: train=9251 val=9251 C=0.01 acc=0.690 brier=0.1986 auc=0.684
+2026-04-28 18:13:55 [INFO       ] tennis_edge.model.training:   Fold 2: train=18502 val=9251 C=0.01 acc=0.701 brier=0.1940 auc=0.703
+2026-04-28 18:13:56 [INFO       ] tennis_edge.model.training:   Fold 3: train=27754 val=9251 C=0.01 acc=0.701 brier=0.1979 auc=0.681
+2026-04-28 18:13:56 [INFO       ] tennis_edge.model.training:   Fold 4: train=37005 val=9251 C=0.01 acc=0.657 brier=0.2140 auc=0.661
+2026-04-28 18:13:57 [INFO       ] tennis_edge.model.training:   Fold 5: train=46257 val=9251 C=0.01 acc=0.656 brier=0.2157 auc=0.657
+2026-04-28 18:13:57 [INFO       ] tennis_edge.model.training: Training final model on train+val (C=0.0100)...
+2026-04-28 18:13:57 [INFO       ] tennis_edge.model.training: Computing permutation importance on test set...
+2026-04-28 18:13:59 [INFO       ] tennis_edge.model.training: Model saved to /Users/anthonywen04/Documents/GitHub/Tennis-Edge/data/models/latest.joblib

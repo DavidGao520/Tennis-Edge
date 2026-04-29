@@ -10,23 +10,27 @@ A quantitative tennis prediction market trading bot for [Kalshi](https://kalshi.
 
 ## Current Architecture
 
+Tennis-Edge now has a Phase 1 model foundation plus a Phase 3A trading-assistant layer.
+
 ```
-Sackmann (2000-2024) + TennisMyLife (2025-2026) → 78,762 matches
-        ↓
-    Glicko-2 Rating System → 2,775 players rated
-        ↓
-    36-Feature Logistic Regression Model
-        ↓
-    Pre-match Win Probability (anchor)
-        ↓
-Kalshi WebSocket (real-time bid/ask) → Market Implied Probability
-        ↓
-    Edge = Pre-match − Market
-        ↓
-    Kelly Criterion → Position Sizing
-        ↓
-    Live Terminal Dashboard (monitor command)
+Sackmann + TennisMyLife → SQLite → Glicko-2 → 36-feature model
+                                                ↓
+                                      Pre-match probability anchor
+                                                ↓
+Kalshi REST/WebSocket → live market prices → model-vs-market edge
+                                                ↓
+                        ┌───────────────────────┼───────────────────────┐
+                        ↓                       ↓                       ↓
+                 Arbitrage Mode          Pre-Bet / Monitor          Agent Mode
+              price discrepancy      human-led research view      Gemini-grounded
+                  scanner               + model anchor           shadow decisions
+                                                                       ↓
+                                                         safety rails + decision log
+                                                                       ↓
+                                                        settlement poller + analytics
 ```
+
+The model is no longer treated as a fully automated live-betting signal. It is a probability anchor. Live Kalshi prices, grounded contextual research, and safety-gated decision logging are the current decision layer.
 
 ---
 
@@ -1028,28 +1032,80 @@ Full suite: 30 passed (20 existing + 10 new).
 
 **Why this is the critical path**: Every day the logger is not running is a day of real Kalshi price data Anthony's backtest engine can never recover. Phase 1 backtest used synthetic odds; phase 2 demo credibility depends entirely on this dataset accumulating cleanly.
 
-**Branch**: All phase 2 work on `phase-2` branch. `main` stays stable. Teammates work in their own forks.
+**Branch status update**: `phase-2` and `cli-ui` have both been merged into `main`. `main` is now the active integration branch for the Phase 3A agent and CLI launch-screen work.
 
-## Phase 2 — Open Workstreams
+---
 
-### David
-- [x] Tick logger (technically Anthony's workstream but David built it Day 1 to start data accumulation)
-- [ ] Agent shadow-trade logging skeleton (`agent_decisions` table + writer)
-- [ ] Gemini API client + structured EV prompt v1
-- [ ] LLM research R-key in monitor
+## Current State (as of April 29, 2026)
 
-### Anthony
-- [ ] Monitor layout redesign (multi-panel: market list / detail / research / positions)
-- [ ] Onboarding wizard (first-run flow: ingest → train → first paper trade)
-- [ ] Real backtest engine consuming `market_ticks` data
+### Shipped on `main`
 
-### Billy
-- [ ] Arbitrage feasibility study (Week 1 gate): pull Kalshi + Polymarket tennis orderbooks, check 3 arb types (cross-venue, intra-Kalshi YES/NO sum, related-market consistency). Decision criteria: ≥5 actionable signals/day with >$5 expected profit each → continue. Else pivot to backtest support.
+- [x] Tick logger: `tennis-edge log-ticks` streams Kalshi tennis ticks into `market_ticks`.
+- [x] Agent decision log: append-only `agent_decisions.jsonl` and `agent_settlements.jsonl`.
+- [x] Gemini grounded research provider: Google Search grounding, structured EV schema, budget tracking, and prompt regression evals.
+- [x] Safety rails: pause/flatten file flags, LLM failure kill switch, stale feed checks, budget checks, daily loss checks, and order failure kill switch.
+- [x] Single-process agent: `MonitorBridge` polls Kalshi, caches prices, emits candidates, and feeds `AgentLoop` without requiring the tick logger to be running.
+- [x] Settlement poller: joins shadow decisions to market outcomes for counterfactual P&L.
+- [x] Runtime wiring: `tennis-edge agent start/status/pause/resume/flatten`.
+- [x] Interactive CLI launch screen: default `tennis-edge` menu, onboarding wizard, setup command, settings menu, and credential checks.
 
-## Phase 2 — Premises Being Tested
+### Current Product Shape
 
-1. **Tennis arb opportunities exist on Kalshi at meaningful frequency.** UNVERIFIED — Billy's week 1 study confirms or pivots.
-2. **LLM with screenshot + structured prompt produces useful EV analysis.** PARTIALLY VERIFIED ($10K/month with Gemini). Agent shadow-trade phase tests reproducibility without human judgment in loop.
-3. **5 weeks of WebSocket-collected Kalshi prices = sufficient sample for credible backtest.** Reasonable for high-volume markets, marginal for Challengers. Acceptable.
-4. **3 teammates can ship 3 distinct workstreams in 5-6 weeks while integrating cleanly.** Tight. Week 5 reserved for integration. Option 1 has built-in fallback if it fails.
-5. **David's $10K/month manual edge is reproducible signal, not variance.** 275 trades, +5.9% ROI is moderate evidence. Not pure luck given consistency across categories.
+Tennis-Edge is now a three-mode trading assistant:
+
+1. **Arbitrage** — intended to find cross-market or cross-venue price discrepancies. Feasibility is still unproven.
+2. **Pre-Bet / Monitor** — human-led workflow using model anchor, Kalshi price, player context, and optional LLM research.
+3. **Agent** — model scans markets, grounded Gemini researches high-edge candidates, decisions are logged in shadow mode, and safety rails gate any future execution.
+
+The key architecture decision remains: **do not trust the pre-match model alone for live betting**. The model is an anchor. The live market price and grounded contextual research are the decision layer.
+
+### Local Setup Notes
+
+- First-time setup is still the expensive part: download data, ingest SQLite, compute ratings, and train `data/models/latest.joblib`.
+- Normal monitor/agent usage should reuse the existing database and model artifact. It should not retrain unless `tennis-edge train` is explicitly run.
+- `ratings` and `train` are still full rebuild commands, not incremental update commands.
+- Real backtest credibility depends on accumulating `market_ticks`; an empty local `market_ticks` table means no local historical Kalshi price sample yet.
+
+## Remaining Workstreams
+
+### Frontend / Dashboard
+
+- [ ] Build a real frontend or dashboard around the three modes: Arbitrage, Pre-Bet / Monitor, and Agent.
+- [ ] Track strategy-level performance by mode: trades, win rate, net P&L, ROI, average edge, average stake, and max drawdown.
+- [ ] Show current agent state, kill switches, recent decisions, settlements, and budget usage.
+- [ ] Keep execution controls gated behind visible safety state. Read-only dashboard first; live order buttons later.
+
+### Data & Model Operations
+
+- [ ] Ensure 2025-2026 TennisMyLife data is present in local/team environments and included in the DB.
+- [ ] Add or document a clean refresh workflow for ingest → ratings → train.
+- [ ] Consider incremental ratings/model refresh later; current commands are full rebuilds.
+- [ ] Add `.gitignore` coverage for generated runtime files such as `data/*.db-wal`, `data/*.db-shm`, and `data/*.log`.
+
+### Agent Validation
+
+- [ ] Run the first sustained Phase 3A paper/shadow session on the Mac mini.
+- [ ] Collect enough `agent_decisions.jsonl` + settlement data to estimate recommendation quality.
+- [ ] Compare Agent recommendations against David's manual workflow by market type and mode.
+- [ ] Decide whether Phase 3B human-in-loop execution is justified.
+- [ ] Defer restricted auto-execute until shadow results show the agent can match or beat manual decision quality.
+
+### Backtesting
+
+- [ ] Build the real backtest engine over collected `market_ticks` instead of synthetic odds.
+- [ ] Report strategy-specific metrics for Arbitrage, Pre-Bet, and Agent modes.
+- [ ] Join historical model predictions, market prices, and settlement outcomes into one analysis surface.
+
+### Arbitrage
+
+- [ ] Complete feasibility study: Kalshi internal YES/NO inconsistencies, related-market inconsistencies, and cross-venue checks.
+- [ ] Continue only if the study finds enough actionable signals after fees, spread, and available liquidity.
+- [ ] If not viable, pivot effort to backtest infrastructure and dashboard analytics.
+
+## Premises Still Being Tested
+
+1. **Tennis arbitrage exists at meaningful frequency.** Still unverified.
+2. **Grounded LLM analysis improves live tennis decisions.** Partially verified by David's manual workflow; needs agent shadow validation.
+3. **Collected Kalshi ticks are enough for credible backtests.** Depends on running the logger long enough across active market hours.
+4. **Three modes can be measured separately.** This requires every trade/decision to carry a mode label: `arbitrage`, `pre_bet`, or `agent`.
+5. **David's manual edge is reproducible signal, not variance.** Existing trade history is encouraging, but the agent must prove it with prospective logs.
