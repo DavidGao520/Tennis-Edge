@@ -393,7 +393,18 @@ def _agent_submenu(cfg) -> None:
             return
 
 
+def _has_tmux() -> bool:
+    """Detect tmux on PATH. Used to choose between recommending
+    'tmux new -s agent' (preferred) vs running the agent foreground
+    directly (fallback when tmux isn't installed)."""
+    import shutil
+    return shutil.which("tmux") is not None
+
+
 def _print_agent_start_command(cfg, *, mode: str) -> None:
+    """Show the user a one-line `tennis-edge agent start` command they
+    can copy verbatim. Displayed OUTSIDE any Rich panel so terminal
+    box-border characters do not contaminate the copy buffer."""
     if mode == "live":
         if not check_setup(cfg)["kalshi"]:
             console.print(Panel(
@@ -406,34 +417,63 @@ def _print_agent_start_command(cfg, *, mode: str) -> None:
             except KeyboardInterrupt:
                 pass
             return
-        cmd = (
-            "tennis-edge agent start --executor live --whitelist atp-wta-main \\\n"
-            "  --min-prematch-ev 0.08 --gemini-budget 5.00 \\\n"
-            "  --max-position 1.00 --max-total-exposure 20.00 \\\n"
-            "  --daily-loss-limit 10.00 --bankroll 100.00 --mode auto"
-        )
-        warning = (
-            "[bold red]LIVE MODE — real money.[/bold red]\n"
+        cmd_parts = [
+            "tennis-edge agent start",
+            "--executor live",
+            "--whitelist atp-wta-main",
+            "--min-prematch-ev 0.08",
+            "--gemini-budget 5.00",
+            "--max-position 1.00",
+            "--max-total-exposure 20.00",
+            "--daily-loss-limit 10.00",
+            "--bankroll 100.00",
+            "--mode auto",
+        ]
+        header = (
+            "[bold red]LIVE MODE — real money.[/bold red] "
             "Default caps: $1/order, $20 total exposure, $10 daily loss kill."
         )
     else:
-        cmd = (
-            "tennis-edge agent start --executor paper --whitelist atp-wta-main \\\n"
-            "  --min-prematch-ev 0.08 --gemini-budget 2.00 --mode shadow"
-        )
-        warning = "[green]Paper mode — no real money at risk.[/green]"
+        cmd_parts = [
+            "tennis-edge agent start",
+            "--executor paper",
+            "--whitelist atp-wta-main",
+            "--min-prematch-ev 0.08",
+            "--gemini-budget 2.00",
+            "--mode shadow",
+        ]
+        header = "[green]Paper mode — no real money at risk.[/green]"
 
-    console.print(Panel(
-        f"{warning}\n\n"
-        "Run inside tmux so SSH disconnects don't kill the daemon:\n\n"
-        f"  [cyan]tmux new -s agent[/cyan]\n"
-        f"  [cyan]{cmd}[/cyan]\n"
-        f"  [dim](Ctrl+B D to detach. Re-attach: tmux attach -t agent)[/dim]",
-        title=f"Agent → Start ({mode})",
-        expand=False,
-    ))
+    cmd_oneline = " ".join(cmd_parts)
+
+    # Header inside a panel for visual emphasis (caps, mode warning).
+    console.print(Panel(header, title=f"Agent → Start ({mode})", expand=False))
+
+    # Plain delimiter + single-line command. NO Rich panel around the
+    # command itself — box-border glyphs were getting copied into the
+    # paste buffer, which is the user-reported bug.
+    console.print()
+    console.print(
+        "[dim]──────────── copy the line below (single command) ────────────[/dim]"
+    )
+    console.print(cmd_oneline, style="bold cyan", soft_wrap=True)
+    console.print("[dim]───────────────────────── end ─────────────────────────[/dim]")
+    console.print()
+
+    # tmux instructions — fallback for systems without tmux installed.
+    if _has_tmux():
+        console.print("[bold]Recommended[/bold]: run inside tmux so SSH disconnects "
+                      "don't kill the daemon.")
+        console.print("  [cyan]tmux new -s agent[/cyan]   then paste the command above")
+        console.print("  [dim]Ctrl+B D to detach. Re-attach: tmux attach -t agent[/dim]")
+    else:
+        console.print("[yellow]tmux not detected on PATH.[/yellow] Options:")
+        console.print("  • Install: [cyan]brew install tmux[/cyan]   (recommended)")
+        console.print("  • Or paste the command directly into your shell — it will run "
+                      "in the foreground; closing the terminal stops it.")
+
     try:
-        Prompt.ask("Press Enter to return", default="")
+        Prompt.ask("\nPress Enter to return", default="")
     except KeyboardInterrupt:
         pass
 
