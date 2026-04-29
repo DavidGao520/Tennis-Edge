@@ -41,7 +41,7 @@ def _load_dotenv(project_root: Path) -> None:
             _os.environ[key] = value
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.option(
     "--config", "-c",
     type=click.Path(),
@@ -50,7 +50,13 @@ def _load_dotenv(project_root: Path) -> None:
 )
 @click.pass_context
 def main(ctx: click.Context, config: str | None) -> None:
-    """Tennis-Edge: ATP Tennis Prediction Market Trading Bot."""
+    """Tennis-Edge: ATP Tennis Prediction Market Trading Bot.
+
+    Run with no subcommand to enter the interactive menu.
+    Run with a subcommand (e.g. ``tennis-edge agent start``) to
+    invoke that subcommand directly. All existing CLI usage is
+    unchanged.
+    """
     ctx.ensure_object(dict)
 
     if config is None:
@@ -67,6 +73,22 @@ def main(ctx: click.Context, config: str | None) -> None:
     cfg = load_config(config)
     setup_logging(cfg.logging.level, str(Path(cfg.project_root) / cfg.logging.file))
     ctx.obj["config"] = cfg
+
+    # No subcommand → drop into the interactive launch screen.
+    # Existing power-user invocations (`tennis-edge agent start`,
+    # `tennis-edge monitor`, etc.) skip this entirely because Click
+    # only fires this branch when no subcommand was specified.
+    if ctx.invoked_subcommand is None:
+        from .cli_ui import show_launch_screen
+        show_launch_screen(cfg)
+
+
+@main.command()
+@click.pass_context
+def setup(ctx: click.Context) -> None:
+    """Run the first-run onboarding wizard (configure API keys)."""
+    from .cli_ui import run_onboarding
+    run_onboarding(ctx.obj["config"])
 
 
 @main.command()

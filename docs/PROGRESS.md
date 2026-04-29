@@ -255,6 +255,69 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Interactive Launch Screen + Onboarding Wizard + Settings UI
+
+`tennis-edge` (no subcommand) now drops into a 5-option menu instead of dumping `--help`. Built for the demo — first thing teammates see is a polished dashboard, not raw Click output.
+
+**Three layers**:
+
+**1. Launch screen** (`src/tennis_edge/cli_ui.py::show_launch_screen`):
+```
+╭─ Tennis-Edge — Kalshi Tennis Trading Assistant ─────────╮
+│  Setup     ✓ Gemini  ✓ Kalshi  ✓ Model  ✓ Data         │
+│  Bankroll  Kalshi auth configured (balance via Settings)│
+│  Today     0 decisions logged                           │
+╰─────────────────────────────────────────────────────────╯
+  [1] Monitor       Live market scanner with EV signals
+  [2] Agent         Auto-research + paper/live trading
+  [3] Status        Today's decisions, P&L, kill switches
+  [4] Settings      Configure API keys, view config
+  [5] Exit
+```
+
+Status flags refresh every menu iteration. Existing CLI commands (`tennis-edge agent start`, `tennis-edge monitor`, etc.) skip the menu entirely — power users keep their muscle memory.
+
+**2. First-run onboarding** (`run_onboarding`):
+- Auto-triggers when launch screen detects missing Gemini key OR missing model OR empty player DB
+- Walks user through Gemini key (required) and Kalshi key (optional — paper-only mode skips it)
+- Saves to `.env` via `_update_dotenv` (preserves existing comments/keys, atomic write)
+- Points the user at `tennis-edge ingest / ratings / train` for the data prerequisites
+
+**3. Settings sub-menu**:
+- Re-set Gemini key (with masked display of current: `AIza••••••d0c`)
+- Re-set Kalshi key + walk through PEM file placement (`mv ~/Downloads/...pem config/`)
+- **Validate credentials** — makes one real `genai.list_models()` call and one `KalshiClient.get_balance()` call, reports green/red/yellow per provider
+- View full config (sectioned, all `*_id`/`*_key`/`*_secret` fields masked)
+
+**Agent submenu** (option [2]):
+- Show start command (paper) — prints copy-paste tmux + `tennis-edge agent start` for paper mode
+- Show start command (live) — same for live, gates on Kalshi auth being configured
+- Pause / Resume / Flatten — wires through to the existing flag-file IPC (no need to remember subcommand names)
+- View agent status — embedded version of `tennis-edge agent status`
+
+**Design choices documented in module docstring**:
+- Powered by Rich (already a dep). No new TUI framework.
+- All input via `Prompt`/`Confirm`; survives Ctrl-C at every level.
+- `_update_dotenv` preserves comments and other lines (won't trample anything the user wrote).
+- `_mask` redacts secrets when displaying current values (`AIza` + 6 dots + last 4 chars).
+- Agent menu does NOT spawn the daemon directly — it prints the command. Keeps the production tmux pattern correct; beginners see the right command.
+
+**Tests**: `tests/test_cli_ui.py` — 21 cases.
+- `_mask`: empty / short / long / show param (4)
+- `_update_dotenv`: creates / preserves comments / appends / doesn't match commented keys / creates parent dir (5)
+- `_player_count`: missing DB / no table / row count (3)
+- `_kalshi_auth_present`: blank id / missing PEM / both set / empty PEM (4)
+- `_model_present`: missing / present (2)
+- `check_setup`: fresh project all-false / Gemini env set / fully configured (3)
+
+Existing 227 tests still pass.
+
+Full suite: **248 passed** (227 prior + 21 new).
+
+**New `setup` subcommand**: `tennis-edge setup` runs the onboarding wizard directly (useful when re-keying without going through the menu).
+
+Smoke-walked all three menu paths end-to-end via piped input — render is clean, refresh works, exit returns 0.
+
 ### April 19, 2026 — Phase 3 v2.1: Aggressive Research Prompt + system_instruction + key_risk
 
 After hand-running the agent on MacBook for the demo prep, the prompt was upgraded based on feedback from David's manual workflow ("my Gemini analyst auto-researches rankings, H2H, surface form, fatigue, injuries — make our agent prompt push for the same"):
