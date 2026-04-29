@@ -77,9 +77,14 @@ def test_mask_short_value_fully_redacted():
 
 
 def test_mask_long_value_keeps_edges():
-    masked = _mask("AIzaSyBP9Pg6qONUNOvXeQXwurgelij-UtIXd0c")
+    # NEVER use a real Gemini key here. Google's leak-detection
+    # service automatically disables any key found in a public repo
+    # (we learned this the hard way once). The fixture below is
+    # length-matched (39 chars, "AIza" prefix) but the body is
+    # all-zero so it cannot be confused with a real credential.
+    masked = _mask("AIza0000000000000000000000000000000fake")
     assert masked.startswith("AIza")
-    assert masked.endswith("Xd0c")
+    assert masked.endswith("fake")
     assert "•" in masked
 
 

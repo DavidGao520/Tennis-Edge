@@ -255,6 +255,33 @@ Full plan in repo at `docs/PROGRESS.md` (this file). Detailed planning artifact 
 
 ## Phase 2 Progress Log
 
+### April 19, 2026 — Security Incident: Gemini Key Leaked via Test Fixture
+
+**Cause**: When writing `test_mask_long_value_keeps_edges` in `test_cli_ui.py`, used the user's REAL Gemini API key as a test fixture for "realistic" `_mask()` output. This was committed in `1db918d` and pushed to GitHub via the `main` and `phase-2` merges. GitGuardian's automated public-repo scanner picked it up within ~30 minutes; Google's own leak detection auto-disabled the key.
+
+**Detection chain**:
+1. User pushes `cli-ui` branch (commits `1db918d`, `faaf0fd`, `8a4d8d8`) and merges to `main` / `phase-2`
+2. GitGuardian scans GitHub → emails user about leaked Google API Key
+3. User goes to Tennis-Edge menu → Settings → Validate → Gemini returns `403 PERMISSION_DENIED: Your API key was reported as leaked`
+4. User flags it; we trace it to the test fixture
+
+**Fix in this commit**:
+- Replaced the fixture with a length-matched but obviously-fake string: `"AIza0000000000000000000000000000000fake"` (39 chars, "AIza" prefix, all zeros body)
+- Added a comment in the test explaining why fixtures must never be real keys
+- Verified no other AIza-pattern strings exist anywhere in `git log --all -p` history
+
+**Did NOT rewrite history**:
+- Force-pushing a rewrite would break clones (David's MacBook, Mac mini, friend who cloned)
+- Disabled key is worthless to anyone who finds it now
+- The dead key sitting in `1db918d` is a learning artifact, not a live risk
+
+**Remediation user did**:
+- Generated new Gemini key at https://aistudio.google.com/apikey
+- Updated local `.env` with new key
+- Old key remains disabled by Google permanently
+
+**Lesson** (for future contributors): test fixtures for credential masking / format validation MUST use synthetic strings. Never paste a real key into `test_*.py`, even temporarily, even in a commit you plan to amend. Google scans every public push within minutes.
+
 ### April 19, 2026 — Multi-Provider LLM UI (Gemini / OpenAI / Claude)
 
 Demo prep feedback: "the status badge says 'Gemini' but we should support multiple LLM providers; let users pick when onboarding."
