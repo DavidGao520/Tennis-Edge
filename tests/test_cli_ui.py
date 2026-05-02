@@ -10,20 +10,25 @@ state is locked in.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import click
 import pytest
 
 from tennis_edge.cli_ui import (
     LLM_PROVIDERS,
     _active_llm_label,
     _has_tmux,
+    _invoke_click_command,
     _kalshi_auth_present,
     _llm_present,
+    _main_menu_selector_frame,
     _mask,
+    _mode_dashboard_stats,
     _model_present,
     _player_count,
     _update_dotenv,
@@ -310,6 +315,68 @@ def test_check_setup_all_true_when_everything_set(tmp_path: Path, monkeypatch):
     )
     setup = check_setup(cfg)
     assert setup == {"llm": True, "kalshi": True, "model": True, "data": True}
+
+
+# ---------------------------------------------------------------------------
+# Mode dashboard stats
+# ---------------------------------------------------------------------------
+
+
+def test_mode_dashboard_stats_groups_settlements_by_mode(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    decisions = [
+        {"decision_id": "agent-1", "mode": "shadow"},
+        {"decision_id": "monitor-1", "mode": "human_in_loop"},
+        {"decision_id": "arb-1", "mode": "arbitrage"},
+    ]
+    settlements = [
+        {"decision_id": "agent-1", "outcome": "won", "realized_pnl": 42.5},
+        {"decision_id": "monitor-1", "outcome": "lost", "realized_pnl": -10},
+        {"decision_id": "arb-1", "outcome": "won", "realized_pnl": 5},
+    ]
+    (data_dir / "agent_decisions.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in decisions)
+    )
+    (data_dir / "agent_settlements.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in settlements)
+    )
+
+    stats = _mode_dashboard_stats(_AppCfg(project_root=str(tmp_path)))
+
+    assert stats["agent"]["settled"] == 1
+    assert stats["agent"]["wins"] == 1
+    assert stats["agent"]["pnl"] == 42.5
+    assert stats["monitor"]["losses"] == 1
+    assert stats["monitor"]["pnl"] == -10
+    assert stats["arbitrage"]["wins"] == 1
+    assert stats["arbitrage"]["pnl"] == 5
+
+
+def test_main_menu_selector_frame_is_horizontal():
+    frame = _main_menu_selector_frame(1)
+    assert "Arbitrage" in frame
+    assert "Monitor" in frame
+    assert "Agent" in frame
+    assert "←/→ or A/D" in frame
+    assert "[bold]Monitor[/bold]" in frame
+    assert "S status" in frame
+    assert "C settings" in frame
+
+
+def test_invoke_click_command_passes_current_config(tmp_path: Path):
+    seen = {}
+
+    @click.command()
+    @click.option("--label")
+    @click.pass_context
+    def fake(ctx, label):
+        seen["root"] = ctx.obj["config"].project_root
+        seen["label"] = label
+
+    _invoke_click_command(fake, _AppCfg(project_root=str(tmp_path)), label="monitor")
+
+    assert seen == {"root": str(tmp_path), "label": "monitor"}
 
 
 # ---------------------------------------------------------------------------

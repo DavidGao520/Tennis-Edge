@@ -2,9 +2,9 @@
 
 Three layers:
 
-1. Launch screen: dashboard + 5-option menu (Monitor / Agent /
-   Status / Settings / Exit). Shown when ``tennis-edge`` is invoked
-   with no subcommand.
+1. Launch screen: dashboard + horizontal mode selector (Arbitrage /
+   Monitor / Agent / Status / Settings / Exit). Shown when
+   ``tennis-edge`` is invoked with no subcommand.
 
 2. First-run onboarding: detects missing API keys / missing model /
    empty DB and walks the user through filling them in. Saves to
@@ -17,8 +17,8 @@ Design notes
 ------------
 
 - Powered by Rich (already a dependency). No new TUI framework.
-- All input via ``rich.prompt.Prompt`` / ``Confirm``; survives Ctrl-C
-  by catching ``KeyboardInterrupt`` at the top of the loop.
+- Input uses ``rich.prompt.Prompt`` / ``Confirm`` for forms, plus a
+  small raw-key selector for the top-level mode carousel.
 - ``_update_dotenv`` preserves existing comments and other lines.
 - ``_mask`` redacts secrets when displaying current values.
 - The Agent menu does NOT spawn the daemon directly — it prints the
@@ -34,9 +34,15 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
+import termios
+import time
+import tty
 from pathlib import Path
 
+import click
 from rich.console import Console
+from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
@@ -78,6 +84,16 @@ LLM_PROVIDERS: dict[str, dict[str, str]] = {
         "status": "saved",
     },
 }
+
+
+MAIN_MENU_OPTIONS = [
+    ("1", "Arbitrage", "Cross-market pricing gaps"),
+    ("2", "Monitor", "Human-led EV review"),
+    ("3", "Agent", "Auto-research + paper/live trading"),
+    ("4", "Status", "Decisions, P&L, kill switches"),
+    ("5", "Settings", "Configure API keys"),
+    ("6", "Exit", "Leave Tennis-Edge"),
+]
 
 
 def _llm_present() -> bool:
@@ -146,6 +162,37 @@ def _player_count(db_path: Path) -> int:
         return 0
 
 
+def _match_date_range(db_path: Path) -> tuple[str | None, str | None]:
+    if not db_path.is_file():
+        return None, None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        try:
+            row = conn.execute(
+                "SELECT MIN(tourney_date), MAX(tourney_date) FROM matches"
+            ).fetchone()
+            if row is None:
+                return None, None
+            return row[0], row[1]
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        return None, None
+
+
+def _market_tick_count(db_path: Path) -> int:
+    if not db_path.is_file():
+        return 0
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM market_ticks").fetchone()[0])
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # .env helper
 # ---------------------------------------------------------------------------
@@ -200,6 +247,7 @@ def _mask(value: str, show: int = 4) -> str:
 
 def show_launch_screen(cfg) -> None:
     """Top-level menu loop. Returns when user picks Exit (or Ctrl-C)."""
+    _show_boot_animation()
     setup = check_setup(cfg)
 
     # Auto-trigger onboarding when the critical bits are missing.
@@ -215,23 +263,22 @@ def show_launch_screen(cfg) -> None:
 
     while True:
         try:
-            _render_main_menu(cfg, setup)
-            choice = Prompt.ask(
-                "Select", choices=["1", "2", "3", "4", "5"], default="1",
-            )
+            choice = _select_main_menu(cfg, setup, default_index=1)
         except KeyboardInterrupt:
             console.print("\n[dim]Goodbye.[/dim]")
             return
 
         if choice == "1":
-            _route_monitor()
+            _route_arbitrage(cfg)
         elif choice == "2":
-            _agent_submenu(cfg)
+            _route_monitor(cfg)
         elif choice == "3":
-            _show_status(cfg)
+            _agent_submenu(cfg)
         elif choice == "4":
-            _settings_submenu(cfg)
+            _show_status(cfg)
         elif choice == "5":
+            _settings_submenu(cfg)
+        elif choice == "6":
             console.print("[dim]Goodbye.[/dim]")
             return
 
@@ -239,7 +286,80 @@ def show_launch_screen(cfg) -> None:
         setup = check_setup(cfg)
 
 
-def _render_main_menu(cfg, setup: dict[str, bool]) -> None:
+def _show_boot_animation() -> None:
+    """Short pixel-art startup animation for interactive terminals."""
+    if os.environ.get("TENNIS_EDGE_SKIP_BOOT_ANIMATION") == "1":
+        return
+    if not console.is_terminal and os.environ.get("TENNIS_EDGE_BOOT_ANIMATION") != "1":
+        return
+
+    frames = [_boot_frame(i) for i in range(40)]
+    with Live(
+        frames[0],
+        console=console,
+        refresh_per_second=10,
+        transient=False,
+    ) as live:
+        for frame in frames[1:]:
+            time.sleep(0.11)
+            live.update(frame)
+
+
+def _boot_frame(step: int) -> str:
+    width = max(36, min(console.width, 82))
+    travel_frames = 30
+    if step >= travel_frames:
+        return _boot_title_frame(width, step - travel_frames)
+
+    ball = _tennis_ball_ascii().splitlines()
+    ball_width = max(len(row) for row in ball)
+    x = round((width - ball_width) * (step / (travel_frames - 1)))
+    trail_start = max(0, x - 18)
+    trail = " " * trail_start + "-" * max(0, x - trail_start)
+
+    rows = ["", trail]
+    rows.extend(f"{' ' * x}{row}" for row in ball)
+    return "\n".join(rows)
+
+
+def _tennis_ball_ascii() -> str:
+    return "\n".join(
+        [
+            r"   ###########",
+            r" ##.........####",
+            r"#############..##",
+            r"#############...##",
+            r"#############..##",
+            r" ##.........####",
+            r"   ###########",
+        ]
+    )
+
+
+def _boot_title_frame(width: int, step: int) -> str:
+    title = "TENNIS-EDGE"
+    subtitle = "Kalshi tennis trading assistant"
+    reveal = min(len(title), step + 2)
+    title_line = title[:reveal]
+    if reveal < len(title):
+        title_line += "-" * (len(title) - reveal)
+    return "\n".join(
+        [
+            "",
+            _center_text("+" + "-" * 15 + "+", width),
+            _center_text(f"|  {title_line}  |", width),
+            _center_text("+" + "-" * 15 + "+", width),
+            "",
+            _center_text(subtitle, width),
+        ]
+    )
+
+
+def _center_text(text: str, width: int) -> str:
+    return f"{text:^{width}}"
+
+
+def _render_main_menu(cfg, setup: dict[str, bool], selected_index: int = 1) -> None:
     status_parts = []
     for label, key in [("LLM", "llm"), ("Kalshi", "kalshi"),
                        ("Model", "model"), ("Data", "data")]:
@@ -262,12 +382,116 @@ def _render_main_menu(cfg, setup: dict[str, bool]) -> None:
     body += f"  [dim]Today     [/dim] {n_decisions} decisions logged"
 
     console.print(Panel(body, expand=False, padding=(1, 2)))
-    console.print("  [bold cyan][1][/bold cyan] Monitor       Live market scanner with EV signals")
-    console.print("  [bold cyan][2][/bold cyan] Agent         Auto-research + paper/live trading")
-    console.print("  [bold cyan][3][/bold cyan] Status        Today's decisions, P&L, kill switches")
-    console.print("  [bold cyan][4][/bold cyan] Settings      Configure API keys, view config")
-    console.print("  [bold cyan][5][/bold cyan] Exit")
+    console.print(Panel(
+        _main_menu_selector_frame(selected_index, _mode_dashboard_stats(cfg)),
+        title="Choose Mode",
+        expand=False,
+        padding=(1, 2),
+    ))
     console.print()
+
+
+def _select_main_menu(cfg, setup: dict[str, bool], default_index: int = 1) -> str:
+    if not console.is_terminal or not sys.stdin.isatty():
+        _render_main_menu(cfg, setup, default_index)
+        return Prompt.ask(
+            "Select",
+            choices=[key for key, _, _ in MAIN_MENU_OPTIONS],
+            default=MAIN_MENU_OPTIONS[default_index][0],
+        )
+
+    index = default_index
+    while True:
+        console.clear()
+        _render_main_menu(cfg, setup, index)
+        key = _read_menu_key()
+        if key in {"right", "d", "tab"}:
+            index = (index + 1) % len(MODE_ROWS)
+        elif key in {"left", "a"}:
+            index = (index - 1) % len(MODE_ROWS)
+        elif key in {"enter", "space"}:
+            return str(index + 1)
+        elif key in {"1", "2", "3"}:
+            return key
+        elif key in {"4", "s"}:
+            return "4"
+        elif key in {"5", "c"}:
+            return "5"
+        elif key in {"6", "q", "esc"}:
+            return "6"
+        elif key == "ctrl-c":
+            raise KeyboardInterrupt
+
+
+def _main_menu_selector_frame(
+    index: int,
+    stats: dict[str, dict[str, int | float]] | None = None,
+) -> str:
+    cells = []
+    for i, (mode, label, _) in enumerate(MODE_ROWS):
+        if i == index:
+            cells.append(f"[reverse bold cyan] {label} [/reverse bold cyan]")
+        else:
+            cells.append(f"[dim]{label}[/dim]")
+
+    mode, label, desc = MODE_ROWS[index]
+    row = stats[mode] if stats else {
+        "settled": 0, "wins": 0, "losses": 0, "voids": 0, "pnl": 0.0,
+    }
+    pnl = float(row["pnl"])
+    pnl_color = "green" if pnl >= 0 else "red"
+    return "\n".join(
+        [
+            "  " + "  |  ".join(cells),
+            "",
+            f"[bold]{label}[/bold]  [dim]{desc}[/dim]",
+            (
+                f"Settled: [bold]{row['settled']}[/bold]   "
+                f"Earned: [{pnl_color}]${pnl:,.2f}[/{pnl_color}]   "
+                f"Success: [bold]{_success_rate(row)}[/bold]"
+            ),
+            "",
+            "[dim]←/→ or A/D move • Enter opens mode • S status • C settings • Q exit[/dim]",
+        ]
+    )
+
+
+def _read_menu_key() -> str:
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x03":
+            return "ctrl-c"
+        if ch in {"\r", "\n"}:
+            return "enter"
+        if ch == " ":
+            return "space"
+        if ch == "\t":
+            return "tab"
+        if ch == "\x1b":
+            seq = sys.stdin.read(2)
+            if seq == "[C":
+                return "right"
+            if seq == "[D":
+                return "left"
+            return "esc"
+        if ch in {"a", "A"}:
+            return "a"
+        if ch in {"d", "D"}:
+            return "d"
+        if ch in {"s", "S"}:
+            return "s"
+        if ch in {"c", "C"}:
+            return "c"
+        if ch in {"q", "Q"}:
+            return "q"
+        if ch in {option[0] for option in MAIN_MENU_OPTIONS}:
+            return ch
+        return ""
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 def _print_setup_status(setup: dict[str, bool]) -> None:
@@ -284,12 +508,10 @@ def _print_setup_status(setup: dict[str, bool]) -> None:
 
 
 def _today_decisions(cfg) -> int:
-    from .agent.decisions import DecisionLog
-    log = DecisionLog(
-        Path(cfg.project_root) / "data" / "agent_decisions.jsonl",
-        Path(cfg.project_root) / "data" / "agent_settlements.jsonl",
-    )
-    return log.count_decisions()
+    path = Path(cfg.project_root) / "data" / "agent_decisions.jsonl"
+    if not path.is_file():
+        return 0
+    return sum(1 for line in path.read_text().splitlines() if line.strip())
 
 
 def _bankroll_line(cfg, setup: dict[str, bool]) -> str:
@@ -304,27 +526,198 @@ def _bankroll_line(cfg, setup: dict[str, bool]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# [1] Monitor
+# Mode performance dashboard
 # ---------------------------------------------------------------------------
 
 
-def _route_monitor() -> None:
+MODE_ROWS = [
+    ("arbitrage", "Arbitrage", "pricing gaps"),
+    ("monitor", "Monitor", "human review"),
+    ("agent", "Agent", "auto research"),
+]
+
+
+def _render_mode_performance_table(cfg) -> None:
+    stats = _mode_dashboard_stats(cfg)
+    tbl = Table(title="Bet Modes", expand=False)
+    tbl.add_column("Mode", style="cyan")
+    tbl.add_column("Use", style="dim")
+    tbl.add_column("Settled", justify="right")
+    tbl.add_column("Earned", justify="right")
+    tbl.add_column("Success", justify="right")
+
+    for key, label, use in MODE_ROWS:
+        row = stats[key]
+        pnl = float(row["pnl"])
+        pnl_color = "green" if pnl >= 0 else "red"
+        tbl.add_row(
+            label,
+            use,
+            str(row["settled"]),
+            f"[{pnl_color}]${pnl:,.2f}[/{pnl_color}]",
+            _success_rate(row),
+        )
+    console.print(tbl)
+
+
+def _mode_dashboard_stats(cfg) -> dict[str, dict[str, int | float]]:
+    stats: dict[str, dict[str, int | float]] = {
+        key: {"decisions": 0, "settled": 0, "wins": 0, "losses": 0, "voids": 0, "pnl": 0.0}
+        for key, _, _ in MODE_ROWS
+    }
+    root = Path(cfg.project_root)
+    decisions_path = root / "data" / "agent_decisions.jsonl"
+    settlements_path = root / "data" / "agent_settlements.jsonl"
+
+    decision_modes: dict[str, str] = {}
+    for rec in _read_jsonl(decisions_path):
+        mode = _dashboard_mode_key(rec)
+        if mode is None:
+            mode = "agent"
+        decision_id = str(rec.get("decision_id", ""))
+        if decision_id:
+            decision_modes[decision_id] = mode
+        stats[mode]["decisions"] += 1
+
+    for rec in _read_jsonl(settlements_path):
+        decision_id = str(rec.get("decision_id", ""))
+        mode = _dashboard_mode_key(rec) or decision_modes.get(decision_id, "agent")
+        row = stats[mode]
+        row["settled"] += 1
+        outcome = str(rec.get("outcome", "")).lower()
+        if outcome == "won":
+            row["wins"] += 1
+        elif outcome == "lost":
+            row["losses"] += 1
+        else:
+            row["voids"] += 1
+        row["pnl"] += _safe_float(rec.get("realized_pnl", 0.0))
+
+    return stats
+
+
+def _dashboard_mode_key(rec: dict) -> str | None:
+    raw = str(rec.get("strategy_mode") or rec.get("mode") or "").lower()
+    if raw in {"arbitrage", "arb"}:
+        return "arbitrage"
+    if raw in {"monitor", "pre_bet", "human_in_loop"}:
+        return "monitor"
+    if raw in {"agent", "shadow", "auto"}:
+        return "agent"
+    return None
+
+
+def _success_rate(row: dict[str, int | float]) -> str:
+    graded = int(row["wins"]) + int(row["losses"])
+    if graded == 0:
+        return "—"
+    return f"{int(row['wins']) / graded:.0%}"
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    rows = []
+    for line in path.read_text().splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            rows.append(rec)
+    return rows
+
+
+def _safe_float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _invoke_click_command(command: click.Command, cfg, **kwargs) -> None:
+    ctx = click.Context(command)
+    ctx.obj = {"config": cfg}
+    with ctx:
+        command.callback(**kwargs)
+
+
+def _mode_requires_kalshi(cfg, mode_label: str) -> bool:
+    if check_setup(cfg)["kalshi"]:
+        return True
     console.print(Panel(
-        "Monitor is a live full-screen dashboard.\n\n"
-        "[bold]Run from your shell:[/bold]\n\n"
-        "  [cyan]tennis-edge monitor[/cyan]\n\n"
-        "[dim]It opens its own TUI. Ctrl-C to quit.[/dim]",
-        title="[1] Monitor",
+        f"{mode_label} needs Kalshi auth to fetch live markets.\n\n"
+        "Open [bold]Settings[/bold] from the dashboard and set your "
+        "Kalshi API key first.",
+        title=f"{mode_label} unavailable",
         expand=False,
     ))
     try:
-        Prompt.ask("Press Enter to return to menu", default="")
+        Prompt.ask("Press Enter to return to dashboard", default="")
+    except KeyboardInterrupt:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# [1] Arbitrage
+# ---------------------------------------------------------------------------
+
+
+def _route_arbitrage(cfg) -> None:
+    if not _mode_requires_kalshi(cfg, "Arbitrage"):
+        return
+
+    console.print(Panel(
+        "Entering Arbitrage mode from the dashboard.\n\n"
+        "Today this uses the existing live EV opportunity scanner. "
+        "Dedicated cross-book arbitrage tracking can plug into this "
+        "same dashboard mode next.",
+        title="[1] Arbitrage",
+        expand=False,
+    ))
+    try:
+        from .cli import opportunities
+        _invoke_click_command(opportunities, cfg, min_edge=cfg.strategy.min_edge, category="all")
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Arbitrage scan stopped.[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Arbitrage scan failed: {e}[/red]")
+
+    try:
+        Prompt.ask("Press Enter to return to dashboard", default="")
     except KeyboardInterrupt:
         pass
 
 
 # ---------------------------------------------------------------------------
-# [2] Agent submenu
+# [2] Monitor
+# ---------------------------------------------------------------------------
+
+
+def _route_monitor(cfg) -> None:
+    if not _mode_requires_kalshi(cfg, "Monitor"):
+        return
+
+    console.print(Panel(
+        "Entering Monitor mode from the dashboard.\n\n"
+        "Ctrl-C stops the live monitor and returns you here.",
+        title="[2] Monitor",
+        expand=False,
+    ))
+    try:
+        from .cli import monitor
+        _invoke_click_command(monitor, cfg)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Monitor stopped.[/yellow]")
+    try:
+        Prompt.ask("Press Enter to return to dashboard", default="")
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# [3] Agent submenu
 # ---------------------------------------------------------------------------
 
 
@@ -479,7 +872,7 @@ def _print_agent_start_command(cfg, *, mode: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# [3] Status
+# [4] Status
 # ---------------------------------------------------------------------------
 
 
@@ -533,7 +926,7 @@ def _show_status(cfg) -> None:
 
 
 # ---------------------------------------------------------------------------
-# [4] Settings
+# [5] Settings
 # ---------------------------------------------------------------------------
 
 
@@ -862,6 +1255,18 @@ def run_onboarding(cfg) -> None:
             "  [cyan]tennis-edge ingest[/cyan]    [dim]# downloads tennis match data[/dim]\n"
             "  [cyan]tennis-edge ratings[/cyan]   [dim]# computes Glicko-2[/dim]\n"
             "  [cyan]tennis-edge train[/cyan]     [dim]# trains logistic model[/dim]\n",
+        )
+
+    db_path = Path(cfg.project_root) / cfg.database.path
+    first_match, last_match = _match_date_range(db_path)
+    if last_match:
+        console.print(
+            f"\n[dim]Local match data currently covers {first_match} → {last_match}.[/dim]"
+        )
+    if _market_tick_count(db_path) == 0:
+        console.print(
+            "[dim]No local Kalshi ticks yet. For real backtests, run "
+            "`tennis-edge log-ticks` on an always-on machine.[/dim]"
         )
 
     # LLM key is required for the agent path. Skip prompt only if

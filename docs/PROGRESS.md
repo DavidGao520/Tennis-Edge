@@ -21,7 +21,7 @@ Kalshi REST/WebSocket → live market prices → model-vs-market edge
                                                 ↓
                         ┌───────────────────────┼───────────────────────┐
                         ↓                       ↓                       ↓
-                 Arbitrage Mode          Pre-Bet / Monitor          Agent Mode
+                 Arbitrage Mode             Monitor Mode            Agent Mode
               price discrepancy      human-led research view      Gemini-grounded
                   scanner               + model anchor           shadow decisions
                                                                        ↓
@@ -168,7 +168,7 @@ The model is no longer treated as a fully automated live-betting signal. It is a
 
 ---
 
-## Current State (as of April 14, 2026)
+## Phase 1 State (as of April 14, 2026)
 
 ### What Works
 - ✅ 78,762 matches ingested (2000-2026)
@@ -1048,13 +1048,14 @@ Full suite: 30 passed (20 existing + 10 new).
 - [x] Settlement poller: joins shadow decisions to market outcomes for counterfactual P&L.
 - [x] Runtime wiring: `tennis-edge agent start/status/pause/resume/flatten`.
 - [x] Interactive CLI launch screen: default `tennis-edge` menu, onboarding wizard, setup command, settings menu, and credential checks.
+- [x] Dashboard-style `tennis-edge` entrypoint: pixel tennis boot animation, horizontal mode selector, per-mode settled/P&L/success stats, and in-dashboard routing into Monitor/Arbitrage.
 
 ### Current Product Shape
 
 Tennis-Edge is now a three-mode trading assistant:
 
 1. **Arbitrage** — intended to find cross-market or cross-venue price discrepancies. Feasibility is still unproven.
-2. **Pre-Bet / Monitor** — human-led workflow using model anchor, Kalshi price, player context, and optional LLM research.
+2. **Monitor** — human-led workflow using model anchor, Kalshi price, player context, and optional LLM research.
 3. **Agent** — model scans markets, grounded Gemini researches high-edge candidates, decisions are logged in shadow mode, and safety rails gate any future execution.
 
 The key architecture decision remains: **do not trust the pre-match model alone for live betting**. The model is an anchor. The live market price and grounded contextual research are the decision layer.
@@ -1070,8 +1071,9 @@ The key architecture decision remains: **do not trust the pre-match model alone 
 
 ### Frontend / Dashboard
 
-- [ ] Build a real frontend or dashboard around the three modes: Arbitrage, Pre-Bet / Monitor, and Agent.
-- [ ] Track strategy-level performance by mode: trades, win rate, net P&L, ROI, average edge, average stake, and max drawdown.
+- [x] Build the first CLI dashboard around the three modes: Arbitrage, Monitor, and Agent.
+- [ ] Extend dashboard metrics beyond settled/P&L/success into trades, ROI, average edge, average stake, and max drawdown.
+- [ ] Add durable mode-specific logging for Monitor and Arbitrage so their dashboard stats are backed by real trade/decision records.
 - [ ] Show current agent state, kill switches, recent decisions, settlements, and budget usage.
 - [ ] Keep execution controls gated behind visible safety state. Read-only dashboard first; live order buttons later.
 
@@ -1080,7 +1082,7 @@ The key architecture decision remains: **do not trust the pre-match model alone 
 - [ ] Ensure 2025-2026 TennisMyLife data is present in local/team environments and included in the DB.
 - [ ] Add or document a clean refresh workflow for ingest → ratings → train.
 - [ ] Consider incremental ratings/model refresh later; current commands are full rebuilds.
-- [ ] Add `.gitignore` coverage for generated runtime files such as `data/*.db-wal`, `data/*.db-shm`, and `data/*.log`.
+- [x] Add `.gitignore` coverage for generated runtime files such as `data/*.db-wal`, `data/*.db-shm`, and `data/*.log`.
 
 ### Agent Validation
 
@@ -1093,7 +1095,7 @@ The key architecture decision remains: **do not trust the pre-match model alone 
 ### Backtesting
 
 - [ ] Build the real backtest engine over collected `market_ticks` instead of synthetic odds.
-- [ ] Report strategy-specific metrics for Arbitrage, Pre-Bet, and Agent modes.
+- [ ] Report strategy-specific metrics for Arbitrage, Monitor, and Agent modes.
 - [ ] Join historical model predictions, market prices, and settlement outcomes into one analysis surface.
 
 ### Arbitrage
@@ -1107,5 +1109,5 @@ The key architecture decision remains: **do not trust the pre-match model alone 
 1. **Tennis arbitrage exists at meaningful frequency.** Still unverified.
 2. **Grounded LLM analysis improves live tennis decisions.** Partially verified by David's manual workflow; needs agent shadow validation.
 3. **Collected Kalshi ticks are enough for credible backtests.** Depends on running the logger long enough across active market hours.
-4. **Three modes can be measured separately.** This requires every trade/decision to carry a mode label: `arbitrage`, `pre_bet`, or `agent`.
+4. **Three modes can be measured separately.** This requires every trade/decision to carry a mode label: `arbitrage`, `monitor`, or `agent`.
 5. **David's manual edge is reproducible signal, not variance.** Existing trade history is encouraging, but the agent must prove it with prospective logs.
